@@ -20,6 +20,17 @@ sell_rise_threshold = 0.01  # 1% rise from buy-in price
 trend_window = 5
 trend_tolerance = 0.0001
 FEE_PCT_POINTS = 0.8  # Net P/L = Gross P/L - 0.8%
+
+# Profitability tuning
+EMA_FAST_PERIOD = 20
+EMA_SLOW_PERIOD = 100
+VOL_LOOKBACK = 30
+MAX_ENTRY_VOL = 0.03  # avoid entries during very high short-term volatility
+BASE_RISK_FRACTION = 0.35  # baseline fraction of fiat deployed per trade
+MAX_RISK_FRACTION = 0.75
+MIN_RISK_FRACTION = 0.20
+MIN_NET_TARGET = 0.012  # target at least 1.2% to clear fees/slippage
+
 last_balance_check = 0
 balance_cache = (0.0, 0.0)
 # Google Sheets
@@ -45,6 +56,7 @@ entry_price = None
 trade_count = 0
 
 recent_changes = deque(maxlen=trend_window)
+price_history = deque(maxlen=EMA_SLOW_PERIOD + 5)
 mode = 'waiting'
 peak_price = 0.0
 
@@ -70,240 +82,7 @@ def load_email_keys(file_path: str = 'email.key'):
 email_keys = load_email_keys()
 if email_keys:
     EMAIL_SENDER = email_keys.get('EMAIL_SENDER', '')
-    EMAIL_PASSWORD = email_keys.get('EMAIL_PASSWORD', '')
-    EMAIL_RECEIVER = email_keys.get('EMAIL_RECEIVER', '')
-    if not (EMAIL_SENDER and EMAIL_PASSWORD and EMAIL_RECEIVER):
-        print("⚠️ email.key incomplete. Email alerts will be disabled.")
-        EMAIL_ALERTS = False
-else:
-    EMAIL_ALERTS = False
-    EMAIL_SENDER = EMAIL_PASSWORD = EMAIL_RECEIVER = ""
-
-
-def send_email(subject: str, message: str):
-    if not EMAIL_ALERTS:
-        return
-    try:
-        msg = MIMEText(message)
-        msg['Subject'] = subject
-        msg['From'] = EMAIL_SENDER
-        msg['To'] = EMAIL_RECEIVER
-
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            server.starttls()
-            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            server.send_message(msg)
-        print(f"📧 Email sent: {subject}")
-    except Exception as e:
-        print(f"⚠️ Failed to send email: {e}")
-
-
-def send_alert(subject: str, message: str):
-    send_email(subject, message)
-
-
-def next_top_of_hour(dt: Optional[datetime] = None) -> datetime:
-    if dt is None:
-        dt = datetime.now()
-    return dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-
-
-def kraken_api_call(method, endpoint, data=None, max_retries=3):
-    for attempt in range(max_retries):
-        try:
-            if method == 'public':
-                response = api.query_public(endpoint, data or {})
-            elif method == 'private':
-                response = api.query_private(endpoint, data or {})
-            else:
-                raise ValueError("Invalid Kraken API method")
-
-            if response.get("error"):
-                if any("EAPI:Rate limit exceeded" in err for err in response["error"]):
-                    wait_time = 2 ** attempt
-                    print(f"Rate limit exceeded. Retrying in {wait_time} seconds...")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    return response
-            return response
-        except Exception as e:
-            print(f"Kraken API {method}::{endpoint} failed on attempt {attempt + 1}: {e}")
-            time.sleep(2 ** attempt)
-    print(f"Kraken API {method}::{endpoint} failed after {max_retries} attempts.")
-    return None
-
-
-# ----- API SETUP -----
-api = krakenex.API()
-try:
-    api.load_key('kraken.key')
-except FileNotFoundError:
-    print("⚠️ No kraken.key file found. Running in SIMULATION mode.")
-    SIMULATION = True
-
-
-def get_price():
-    res = kraken_api_call('public', 'Ticker', {'pair': pair})
-    if not res or 'result' not in res:
-        return None
-    return float(res['result'][list(res['result'].keys())[0]]['c'][0])
-
-
-def get_balance():
-    global last_balance_check, balance_cache
-
-    now = time.time()
-    if now - last_balance_check < 10:  # Use cached value for 10 seconds
-        return balance_cache
-
-    res = kraken_api_call('private', 'Balance')
-    if not res or 'result' not in res:
-        print(f"⚠️ Failed to get balance response: {res}")
-        return balance_cache  # Use last known balance on failure
-
-    try:
-        fiat = float(res['result'].get('ZUSD', 0.0))
-        crypto = float(res['result'].get('XXRP', 0.0))
-        balance_cache = (fiat, crypto)
-        last_balance_check = now
-        return balance_cache
-    except Exception as e:
-        print(f"⚠️ Balance parsing error: {e}")
-        return balance_cache
-
-
-# ========================
-# ----- GOOGLE SHEETS -----
-# ========================
-gc = None
-doc = None
-trade_sheet = None
-
-def init_gspread():
-    global gc, doc, trade_sheet
-    if gc is not None:
-        return
-
-    key_path = os.path.abspath(GOOGLE_KEY_FILE)
-    scope = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive"
-    ]
-    credentials = ServiceAccountCredentials.from_json_keyfile_name(key_path, scope)
-    gc = gspread.authorize(credentials)
-
-    doc = gc.open(GOOGLE_SHEET_NAME)
-
-    try:
-        trade_sheet = doc.worksheet("Trades")
-    except gspread.WorksheetNotFound:
-        trade_sheet = doc.add_worksheet("Trades", rows="1000", cols="10")
-        trade_sheet.append_row(["Time", "Type", "Price", "Volume", "Fiat", "Crypto"])
-
-
-def log_trade(trade_type, price, volume, fiat_after, crypto_after):
-    init_gspread()
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    row = [
-        timestamp,
-        trade_type,
-        round(price, 6),
-        round(volume, 6),
-        round(fiat_after, 6),
-        round(crypto_after, 8)
-    ]
-    try:
-        trade_sheet.append_row(row, value_input_option="RAW")
-    except Exception as e:
-        print(f"⚠️ Google Sheets trade log failed: {e}")
-        send_alert("Trade Log Error", str(e))
-
-# ========================
-# ----- RECOVERY -----
-# ========================
-
-def get_last_buy_price():
-    """Get the price of the most recent buy trade from Kraken trade history"""
-    try:
-        response = kraken_api_call('private', 'TradesHistory', {'trades': True, 'start': 0})
-        if not response or 'result' not in response or 'trades' not in response['result']:
-            print("⚠️ Could not get trade history")
-            return None
-        trades = response['result']['trades']
-        sorted_trades = sorted(trades.items(), key=lambda x: float(x[1]['time']), reverse=True)
-        for trade_id, trade_data in sorted_trades:
-            if trade_data.get('pair') == pair and trade_data.get('type') == 'buy':
-                buy_price = float(trade_data['price'])
-                trade_time = datetime.fromtimestamp(float(trade_data['time']))
-                print(f"📊 Found last buy: {buy_price:.6f} at {trade_time}")
-                return buy_price
-        print("⚠️ No recent XRP buy trades found in history")
-        return None
-    except Exception as e:
-        print(f"⚠️ Error getting last buy price: {e}")
-        return None
-
-
-def recover_state_from_balance():
-    """Recover trading state by checking actual Kraken balances and trade history"""
-    global entry_price, mode
-    try:
-        fiat, crypto = get_balance()
-        if crypto > 0.01:  # Using same threshold as your safety check
-            mode = 'holding'
-            for attempt in range(3):
-                entry_price = get_last_buy_price()
-                if entry_price:
-                    print(f"🔁 Recovered mode: holding, crypto balance: {crypto:.6f}")
-                    print(f"✅ Found last buy price from trade history: {entry_price:.6f}")
-                    return
-                else:
-                    print(f"⚠️ Failed to get buy price, attempt {attempt + 1}/3")
-                    if attempt < 2:
-                        time.sleep(5)
-            error_msg = (
-                f"CRITICAL ERROR: Could not recover entry price!\n\n"
-                f"Crypto balance: {crypto:.6f} XRP\n"
-                f"Mode should be: holding\n"
-                f"Failed after 3 attempts to get trade history.\n"
-                f"Dmitry cannot continue safely without knowing the entry price.\n"
-                f"Time: {datetime.now()}\n\n"
-                f"Please check manually and restart Dmitry."
-            )
-            send_alert("Dmitry Recovery FAILED", error_msg)
-            raise Exception("Failed to recover entry price after 3 attempts")
-        else:
-            mode = 'waiting'
-            entry_price = None
-            print(f"🔁 Recovered mode: waiting, fiat balance: {fiat:.2f}")
-    except Exception as e:
-        print(f"⚠️ Error recovering state from balance: {e}")
-        error_msg = (
-            f"CRITICAL ERROR: State recovery failed!\n\n"
-            f"Error: {str(e)}\n"
-            f"Time: {datetime.now()}\n\n"
-            f"Dmitry cannot start safely."
-        )
-        send_alert("Dmitry Recovery ERROR", error_msg)
-        raise
-
-
-# Initialize logging sheet and recovery
-recover_state_from_balance()
-
-# ========================
-# ----- CORE FUNCS -----
-# ========================
-
-
-
-def place_order(order_type, volume, max_retries=3):
-    for attempt in range(max_retries):
-        try:
-            response = api.query_private('AddOrder', {
-                'pair': pair,
-                'type': order_type,
+@@ -307,68 +319,70 @@ def place_order(order_type, volume, max_retries=3):
                 'ordertype': 'market',
                 'volume': str(volume)
             })
@@ -330,11 +109,14 @@ def place_order(order_type, volume, max_retries=3):
 
 
 def buy_all(fiat_balance, price):
+def buy_all(fiat_balance, price, allocation_fraction=1.0):
     global sim_fiat, sim_crypto, entry_price
     BUFFER = 0.995  # use ~99.5% of available fiat to avoid EOrder:Insufficient funds
 
     if SIMULATION:
         volume = round((fiat_balance * BUFFER) / price, 6)
+        capital_to_use = fiat_balance * max(0.0, min(1.0, allocation_fraction))
+        volume = round((capital_to_use * BUFFER) / price, 6)
         sim_crypto = volume
         sim_fiat = fiat_balance - (volume * price)
         entry_price = price
@@ -347,6 +129,8 @@ def buy_all(fiat_balance, price):
             fiat_before = 0.0
 
         volume = round((fiat_before * BUFFER) / price, 6)
+        capital_to_use = fiat_before * max(0.0, min(1.0, allocation_fraction))
+        volume = round((capital_to_use * BUFFER) / price, 6)
         response = place_order('buy', volume)
 
         if (not response) or ('error' in response and response['error']):
@@ -372,58 +156,7 @@ def buy_all(fiat_balance, price):
 
         crypto_display = crypto_after
         fiat_display = fiat_after
-        sim_fiat = fiat_after
-        sim_crypto = crypto_after
-
-    # Log the trade to Google Sheets
-    log_trade("BUY", actual_price, volume, fiat_display, crypto_display)
-
-    # Email notification
-    body = f"""Dmitry made a buy!
-
-Pair: {pair}
-Entry Price: {actual_price:.6f}
-Volume Bought: {volume:.6f}
-New Balances -> Fiat: {fiat_display:.2f}, Crypto: {crypto_display:.8f}
-Time: {datetime.now()}"""
-
-    send_email("Dmitry made a buy!", body)
-
-
-
-def sell_all(crypto_balance, price):
-    """Sell all crypto_balance and email results without gross/net % calculations."""
-    global sim_fiat, sim_crypto, trade_count, mode, entry_price
-
-    if SIMULATION:
-        sim_fiat = crypto_balance * price
-        sim_crypto = 0.0
-        fiat_display = sim_fiat
-        crypto_display = sim_crypto
-    else:
-        fiat_before, _ = get_balance()
-        if fiat_before is None:
-            fiat_before = 0.0
-
-        if not crypto_balance or crypto_balance <= 0:
-            if mode == 'holding':
-                mode = 'waiting'
-                entry_price = None
-                print("⚠️ State reset: No crypto to sell, switching to waiting mode")
-            return
-
-        if not place_order('sell', crypto_balance):
-            send_email("Dmitry sell failed", "⚠️ Sell order failed.")
-            return
-
-        fiat_after, crypto_after = get_balance()
-        if fiat_after is None:
-            fiat_after = 0.0
-        if crypto_after is None:
-            crypto_after = 0.0
-
-        fiat_display = fiat_after
-        crypto_display = crypto_after
+@@ -427,110 +441,169 @@ def sell_all(crypto_balance, price):
         sim_fiat = fiat_after
         sim_crypto = crypto_after
 
@@ -449,6 +182,50 @@ def is_downtrend(prices, tolerance=0.0001):
     return all(prices[i] > prices[i + 1] + tolerance for i in range(len(prices) - 1))
 
 
+def compute_ema(prices, period):
+    if len(prices) < period:
+        return None
+    values = list(prices)[-period:]
+    k = 2 / (period + 1)
+    ema = values[0]
+    for value in values[1:]:
+        ema = (value * k) + (ema * (1 - k))
+    return ema
+
+
+def realized_volatility(prices, lookback=30):
+    if len(prices) < lookback + 1:
+        return None
+    values = list(prices)[-(lookback + 1):]
+    returns = []
+    for i in range(1, len(values)):
+        prev = values[i - 1]
+        curr = values[i]
+        if prev > 0:
+            returns.append(abs((curr - prev) / prev))
+    if not returns:
+        return None
+    return sum(returns) / len(returns)
+
+
+def get_dynamic_thresholds(vol):
+    if vol is None:
+        return buy_drop_threshold, max(sell_rise_threshold, MIN_NET_TARGET)
+
+    dynamic_buy = max(buy_drop_threshold, vol * 1.6)
+    dynamic_sell = max(sell_rise_threshold, MIN_NET_TARGET, vol * 2.0)
+    return dynamic_buy, dynamic_sell
+
+
+def position_size_fraction(vol):
+    if vol is None:
+        return BASE_RISK_FRACTION
+
+    # deploy less capital as volatility rises
+    scaled = BASE_RISK_FRACTION * (0.015 / max(vol, 0.002))
+    return min(MAX_RISK_FRACTION, max(MIN_RISK_FRACTION, scaled))
+
+
 # ========================
 # ----- MAIN LOOP -----
 # ========================
@@ -470,6 +247,13 @@ try:
             time.sleep(2)
             continue
 
+        price_history.append(price)
+
+        ema_fast = compute_ema(price_history, EMA_FAST_PERIOD)
+        ema_slow = compute_ema(price_history, EMA_SLOW_PERIOD)
+        vol = realized_volatility(price_history, VOL_LOOKBACK)
+        dynamic_buy_drop, dynamic_sell_rise = get_dynamic_thresholds(vol)
+
         fiat, crypto = get_balance()
 
         if mode == 'holding' and crypto <= 0.01:  # 0.01 XRP threshold
@@ -485,20 +269,31 @@ try:
                 peak_price = max(peak_price, price)
 
             dip_triggered = peak_price and (peak_price - price) / peak_price >= buy_drop_threshold
+            dip_triggered = peak_price and (peak_price - price) / peak_price >= dynamic_buy_drop
+            trend_ok = (ema_fast is not None and ema_slow is not None and ema_fast > ema_slow and price > ema_slow)
+            vol_ok = (vol is None) or (vol <= MAX_ENTRY_VOL)
+            allocation_fraction = position_size_fraction(vol)
             if dip_triggered:
                 debug_msg = (
                     f"Dmitry dip check triggered:\n"
                     f"Price: {price:.6f}\n"
                     f"Peak: {peak_price:.6f}\n"
                     f"Dip %: {(peak_price - price) / peak_price:.4%}\n"
+                    f"Required Dip %: {dynamic_buy_drop:.4%}\n"
+                    f"Trend OK: {trend_ok}\n"
+                    f"Volatility: {vol if vol is not None else 'N/A'}\n"
+                    f"Vol OK: {vol_ok}\n"
+                    f"Capital Fraction: {allocation_fraction:.2%}\n"
                     f"Fiat balance: {fiat:.2f}\n"
                     f"Time: {datetime.now()}"
                 )
                 send_email("Dmitry Dip Triggered ", debug_msg)
 
             if dip_triggered and fiat > 1:
+            if dip_triggered and trend_ok and vol_ok and fiat > 1:
                 pre_fiat, pre_crypto = get_balance()
                 buy_all(fiat, price)
+                buy_all(fiat, price, allocation_fraction=allocation_fraction)
                 post_fiat, post_crypto = get_balance()
 
                 if abs(pre_fiat - post_fiat) < 1e-6:
@@ -509,6 +304,7 @@ try:
 
         elif mode == 'holding':
             if price >= entry_price * (1 + sell_rise_threshold):
+            if price >= entry_price * (1 + dynamic_sell_rise):
                 pre_fiat, pre_crypto = get_balance()
                 sell_all(crypto, price)
                 post_fiat, post_crypto = get_balance()
@@ -533,4 +329,3 @@ except Exception as e:
     err = "".join(traceback.format_exception(type(e), e, e.__traceback__))
     send_alert("Dmitry Crashed!", f"Dmitry crashed with error:\n\n{err}")
     raise
-
