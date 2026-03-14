@@ -1,0 +1,14 @@
+# Credentials
+email.key
+kraken.key
+google_key.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS
+.DS_Store
