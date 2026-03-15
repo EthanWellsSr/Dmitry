@@ -1,5 +1,6 @@
 import krakenex
 import time
+from collections import deque
 from datetime import datetime, timedelta
 import traceback
 import gspread
@@ -16,17 +17,42 @@ import os
 SIMULATION = False
 
 PAIR = 'XXRPZUSD'
-BUY_DROP_THRESHOLD = 0.005
-SELL_RISE_THRESHOLD = 0.01
 
+# EMA periods for trend / regime detection
+EMA_FAST_PERIOD = 20
+EMA_SLOW_PERIODS = [100, 200, 400]        # EMA20 is scored against all three
+PRICE_HISTORY_SIZE = max(EMA_SLOW_PERIODS) + 5
+
+# Volatility
+VOL_LOOKBACK = 30
+MAX_ENTRY_VOL = 0.04       # skip entry if realized vol is too high (chaotic market)
+TARGET_VOL = 0.015         # reference vol for full base-size deployment
+
+# Dynamic entry/exit thresholds (scale with realized volatility)
+MIN_BUY_DIP = 0.004        # floor: require at least 0.4% dip from peak
+VOL_DIP_MULT = 1.5         # buy_dip  = max(MIN_BUY_DIP,  vol * VOL_DIP_MULT)
+MIN_SELL_RISE = 0.010      # floor: require at least 1.0% rise (covers fees + slippage)
+VOL_SELL_MULT = 2.0        # sell_rise = max(MIN_SELL_RISE, vol * VOL_SELL_MULT)
+
+# Position sizing (fraction of fiat deployed per trade, scales inversely with vol)
+BASE_RISK_FRACTION = 0.50
+MAX_RISK_FRACTION = 0.90
+MIN_RISK_FRACTION = 0.20
+
+# Exit
+TRAILING_STOP_PCT = 0.018  # sell if price drops 1.8% below highest point since entry
+
+# Google Sheets
 GOOGLE_KEY_FILE = 'google_key.json'
 GOOGLE_SHEET_NAME = 'Dmitry_trades'
 
+# Email alerts
 EMAIL_ALERTS = True
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 SEND_STARTUP_EMAIL = True
 
+# Heartbeat
 HEARTBEAT_ENABLED = True
 HEARTBEAT_SUBJECT = "Dmitry Heartbeat"
 HEARTBEAT_BODY = "Dmitry is still running."
@@ -101,10 +127,10 @@ class SheetsLogger:
             self._sheet = doc.worksheet("Trades")
         except gspread.WorksheetNotFound:
             self._sheet = doc.add_worksheet("Trades", rows="1000", cols="10")
-            self._sheet.append_row(["Time", "Type", "Price", "Volume", "Fiat", "Crypto"])
+            self._sheet.append_row(["Time", "Type", "Price", "Volume", "Fiat", "Crypto", "Note"])
         return self._sheet
 
-    def log(self, trade_type: str, price: float, volume: float, fiat: float, crypto: float):
+    def log(self, trade_type: str, price: float, volume: float, fiat: float, crypto: float, note: str = ''):
         row = [
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             trade_type,
@@ -112,6 +138,7 @@ class SheetsLogger:
             round(volume, 6),
             round(fiat, 6),
             round(crypto, 8),
+            note,
         ]
         try:
             self._get_sheet().append_row(row, value_input_option="RAW")
@@ -229,8 +256,11 @@ class TradingBot:
 
         self.mode = 'waiting'
         self.entry_price: Optional[float] = None
-        self.peak_price = 0.0
+        self.entry_high: float = 0.0   # highest price since entry (drives trailing stop)
+        self.peak_price: float = 0.0   # highest price seen while waiting (drives dip detection)
         self.trade_count = 0
+
+        self.price_history: deque = deque(maxlen=PRICE_HISTORY_SIZE)
 
         # Only meaningful in simulation mode
         self._sim_fiat = 1000.0
@@ -245,6 +275,62 @@ class TradingBot:
             return self._sim_fiat, self._sim_crypto
         return self.kraken.get_balance()
 
+    # ----- INDICATORS -----
+
+    def _ema(self, period: int) -> Optional[float]:
+        if len(self.price_history) < period:
+            return None
+        values = list(self.price_history)[-period:]
+        k = 2 / (period + 1)
+        ema = values[0]
+        for v in values[1:]:
+            ema = v * k + ema * (1 - k)
+        return ema
+
+    def _realized_vol(self) -> Optional[float]:
+        if len(self.price_history) < VOL_LOOKBACK + 1:
+            return None
+        values = list(self.price_history)[-(VOL_LOOKBACK + 1):]
+        returns = [abs((values[i] - values[i - 1]) / values[i - 1]) for i in range(1, len(values)) if values[i - 1] > 0]
+        return sum(returns) / len(returns) if returns else None
+
+    def _market_regime(self, ema_fast: Optional[float], slow_emas: list[Optional[float]]) -> tuple[str, int]:
+        """
+        Scores EMA20 against each of EMA100, EMA200, EMA400.
+        +1 for each slow EMA that EMA20 is above, 0 otherwise.
+
+        Score 3 → bull       (enter, full sizing)
+        Score 2 → mild-bull  (enter, normal sizing)
+        Score 1 → caution    (skip — short-term bounce in a downtrend)
+        Score 0 → bear       (skip)
+        unknown → not enough history yet (enter cautiously)
+        """
+        if ema_fast is None:
+            return 'unknown', -1
+        available = [s for s in slow_emas if s is not None]
+        if not available:
+            return 'unknown', -1
+        score = sum(1 for s in available if ema_fast > s)
+        if score == len(available):
+            return 'bull', score
+        if score >= len(available) - 1:
+            return 'mild-bull', score
+        if score == 0:
+            return 'bear', score
+        return 'caution', score
+
+    def _dynamic_thresholds(self, vol: Optional[float]) -> tuple[float, float]:
+        if vol is None:
+            return MIN_BUY_DIP, MIN_SELL_RISE
+        return max(MIN_BUY_DIP, vol * VOL_DIP_MULT), max(MIN_SELL_RISE, vol * VOL_SELL_MULT)
+
+    def _position_fraction(self, vol: Optional[float]) -> float:
+        """Deploy more capital in calm markets, less when volatile."""
+        if vol is None:
+            return BASE_RISK_FRACTION
+        fraction = BASE_RISK_FRACTION * (TARGET_VOL / max(vol, 0.001))
+        return min(MAX_RISK_FRACTION, max(MIN_RISK_FRACTION, fraction))
+
     # ----- RECOVERY -----
 
     def _recover_state(self):
@@ -254,6 +340,7 @@ class TradingBot:
             for attempt in range(3):
                 self.entry_price = self.kraken.get_last_buy_price()
                 if self.entry_price:
+                    self.entry_high = self.entry_price
                     print(f"🔁 Recovered: holding, crypto={crypto:.6f}, entry={self.entry_price:.6f}")
                     return
                 print(f"⚠️ Buy price recovery attempt {attempt + 1}/3 failed")
@@ -274,9 +361,10 @@ class TradingBot:
 
     # ----- TRADING -----
 
-    def _buy(self, fiat_balance: float, price: float):
+    def _buy(self, fiat_balance: float, price: float, fraction: float = 1.0, regime: str = ''):
+        capital = fiat_balance * max(0.0, min(1.0, fraction))
         if self.simulation:
-            volume = round((fiat_balance * self.BUY_BUFFER) / price, 6)
+            volume = round((capital * self.BUY_BUFFER) / price, 6)
             self._sim_crypto = volume
             self._sim_fiat = fiat_balance - (volume * price)
             self.entry_price = price
@@ -284,7 +372,8 @@ class TradingBot:
             fiat_display, crypto_display = self._sim_fiat, self._sim_crypto
         else:
             fiat_before, _ = self.kraken.get_balance()
-            volume = round((fiat_before * self.BUY_BUFFER) / price, 6)
+            capital = fiat_before * max(0.0, min(1.0, fraction))
+            volume = round((capital * self.BUY_BUFFER) / price, 6)
             response = self.kraken.place_order('buy', volume)
             if not response or response.get('error'):
                 msg = (
@@ -301,14 +390,17 @@ class TradingBot:
             self.entry_price = actual_price
             fiat_display, crypto_display = fiat_after, crypto_after
 
-        self.logger.log("BUY", actual_price, volume, fiat_display, crypto_display)
+        self.entry_high = self.entry_price
+        self.logger.log("BUY", actual_price, volume, fiat_display, crypto_display,
+                        note=f"regime={regime}, frac={fraction:.0%}")
         self.notifier.send("Dmitry made a buy!", (
-            f"Pair: {PAIR}\nEntry Price: {actual_price:.6f}\nVolume: {volume:.6f}\n"
+            f"Pair: {PAIR}\nRegime: {regime}\nEntry Price: {actual_price:.6f}\nVolume: {volume:.6f}\n"
+            f"Capital Deployed: {fraction:.0%}\n"
             f"Balances -> Fiat: {fiat_display:.2f}, Crypto: {crypto_display:.8f}\n"
             f"Time: {datetime.now()}"
         ))
 
-    def _sell(self, crypto_balance: float, price: float):
+    def _sell(self, crypto_balance: float, price: float, reason: str = 'take-profit'):
         if self.simulation:
             self._sim_fiat = crypto_balance * price
             self._sim_crypto = 0.0
@@ -318,6 +410,7 @@ class TradingBot:
                 if self.mode == 'holding':
                     self.mode = 'waiting'
                     self.entry_price = None
+                    self.entry_high = 0.0
                     print("⚠️ State reset: No crypto to sell")
                 return
             response = self.kraken.place_order('sell', crypto_balance)
@@ -328,12 +421,15 @@ class TradingBot:
             fiat_display = fiat_after or 0.0
             crypto_display = crypto_after or 0.0
 
+        pnl_pct = ((price - self.entry_price) / self.entry_price * 100) if self.entry_price else 0.0
         self.mode = 'waiting'
         self.entry_price = None
+        self.entry_high = 0.0
         self.trade_count += 1
-        self.logger.log("SELL", price, crypto_balance, fiat_display, crypto_display)
-        self.notifier.send("Dmitry made a sell!", (
-            f"Trade #: {self.trade_count}\nPair: {PAIR}\nSell Price: {price:.6f}\n"
+        self.logger.log("SELL", price, crypto_balance, fiat_display, crypto_display, note=reason)
+        self.notifier.send(f"Dmitry sold ({reason})", (
+            f"Trade #: {self.trade_count}\nPair: {PAIR}\nReason: {reason}\n"
+            f"Sell Price: {price:.6f}\nP/L: {pnl_pct:+.2f}%\n"
             f"Balances -> Fiat: {fiat_display:.2f}, Crypto: {crypto_display:.8f}\n"
             f"Time: {datetime.now()}"
         ))
@@ -359,27 +455,47 @@ class TradingBot:
                     time.sleep(2)
                     continue
 
+                self.price_history.append(price)
+
+                ema_fast = self._ema(EMA_FAST_PERIOD)
+                slow_emas = [self._ema(p) for p in EMA_SLOW_PERIODS]
+                vol = self._realized_vol()
+                regime, regime_score = self._market_regime(ema_fast, slow_emas)
+                buy_dip, sell_rise = self._dynamic_thresholds(vol)
+                fraction = self._position_fraction(vol)
+                vol_ok = vol is None or vol <= MAX_ENTRY_VOL
+
                 fiat, crypto = self._get_balance()
 
                 if self.mode == 'holding' and crypto <= 0.01:
                     print(f"⚠️ Safety reset: holding mode but crypto={crypto:.8f}")
                     self.mode = 'waiting'
                     self.entry_price = None
+                    self.entry_high = 0.0
 
                 if self.mode == 'waiting':
                     self.peak_price = max(self.peak_price, price) if self.peak_price else price
                     dip_pct = (self.peak_price - price) / self.peak_price
-                    dip_triggered = dip_pct >= BUY_DROP_THRESHOLD
+                    dip_triggered = dip_pct >= buy_dip
+
+                    # Enter if EMA20 is above at least 2 of the 3 slow EMAs (or data is still warming up)
+                    regime_ok = regime in ('bull', 'mild-bull', 'unknown')
 
                     if dip_triggered:
+                        ema_labels = [f"EMA{p}={f'{s:.4f}' if s else 'warming'}" for p, s in zip(EMA_SLOW_PERIODS, slow_emas)]
                         self.notifier.send("Dmitry Dip Triggered", (
                             f"Price: {price:.6f}\nPeak: {self.peak_price:.6f}\n"
-                            f"Dip: {dip_pct:.4%}\nFiat: {fiat:.2f}\nTime: {now}"
+                            f"Dip: {dip_pct:.4%} (threshold: {buy_dip:.4%})\n"
+                            f"EMA{EMA_FAST_PERIOD}={f'{ema_fast:.4f}' if ema_fast else 'warming'}\n"
+                            f"{chr(10).join(ema_labels)}\n"
+                            f"Regime: {regime} (score {regime_score}/3, OK: {regime_ok})\n"
+                            f"Vol: {f'{vol:.4f}' if vol else 'N/A'} (OK: {vol_ok})\n"
+                            f"Capital Fraction: {fraction:.0%}\nFiat: {fiat:.2f}\nTime: {now}"
                         ))
 
-                    if dip_triggered and fiat > 1:
+                    if dip_triggered and regime_ok and vol_ok and fiat > 1:
                         pre_fiat, _ = self._get_balance()
-                        self._buy(fiat, price)
+                        self._buy(fiat, price, fraction=fraction, regime=regime)
                         post_fiat, _ = self._get_balance()
                         if abs(pre_fiat - post_fiat) < 1e-6:
                             self.notifier.send("Dmitry Warning", "Buy may have failed — still in waiting mode.")
@@ -388,12 +504,17 @@ class TradingBot:
                             self.peak_price = price
 
                 elif self.mode == 'holding' and self.entry_price:
-                    if price >= self.entry_price * (1 + SELL_RISE_THRESHOLD):
+                    self.entry_high = max(self.entry_high, price)
+                    take_profit = price >= self.entry_price * (1 + sell_rise)
+                    trailing_stop = price <= self.entry_high * (1 - TRAILING_STOP_PCT)
+
+                    if take_profit or trailing_stop:
+                        reason = 'take-profit' if take_profit else 'trailing-stop'
                         _, pre_crypto = self._get_balance()
-                        self._sell(crypto, price)
+                        self._sell(crypto, price, reason=reason)
                         _, post_crypto = self._get_balance()
                         if abs(pre_crypto - post_crypto) < 1e-6:
-                            self.notifier.send("Dmitry Warning", "Sell may have failed — still in holding mode.")
+                            self.notifier.send("Dmitry Warning", f"Sell ({reason}) may have failed.")
                         else:
                             self.mode = 'waiting'
                             self.peak_price = price
