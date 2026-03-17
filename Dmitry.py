@@ -259,6 +259,7 @@ class TradingBot:
         self.entry_high: float = 0.0   # highest price since entry (drives trailing stop)
         self.peak_price: float = 0.0   # highest price seen while waiting (drives dip detection)
         self.trade_count = 0
+        self._dip_notified = False
 
         self.price_history: deque = deque(maxlen=PRICE_HISTORY_SIZE)
 
@@ -481,7 +482,8 @@ class TradingBot:
                     # Enter if EMA20 is above at least 2 of the 3 slow EMAs (or data is still warming up)
                     regime_ok = regime in ('bull', 'mild-bull', 'unknown')
 
-                    if dip_triggered:
+                    if dip_triggered and not self._dip_notified:
+                        self._dip_notified = True
                         ema_labels = [f"EMA{p}={f'{s:.4f}' if s else 'warming'}" for p, s in zip(EMA_SLOW_PERIODS, slow_emas)]
                         self.notifier.send("Dmitry Dip Triggered", (
                             f"Price: {price:.6f}\nPeak: {self.peak_price:.6f}\n"
@@ -492,6 +494,8 @@ class TradingBot:
                             f"Vol: {f'{vol:.4f}' if vol else 'N/A'} (OK: {vol_ok})\n"
                             f"Capital Fraction: {fraction:.0%}\nFiat: {fiat:.2f}\nTime: {now}"
                         ))
+                    elif not dip_triggered:
+                        self._dip_notified = False
 
                     if dip_triggered and regime_ok and vol_ok and fiat > 1:
                         pre_fiat, _ = self._get_balance()
@@ -502,6 +506,7 @@ class TradingBot:
                         else:
                             self.mode = 'holding'
                             self.peak_price = price
+                            self._dip_notified = False
 
                 elif self.mode == 'holding' and self.entry_price:
                     self.entry_high = max(self.entry_high, price)
