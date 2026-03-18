@@ -34,6 +34,9 @@ VOL_DIP_MULT = 1.5         # buy_dip  = max(MIN_BUY_DIP,  vol * VOL_DIP_MULT)
 MIN_SELL_RISE = 0.010      # floor: require at least 1.0% rise (covers fees + slippage)
 VOL_SELL_MULT = 2.0        # sell_rise = max(MIN_SELL_RISE, vol * VOL_SELL_MULT)
 
+# Minimum order size (Kraken requires at least 1 XRP per order)
+MIN_BUY_VOLUME = 1.0
+
 # Position sizing (fraction of fiat deployed per trade, scales inversely with vol)
 BASE_RISK_FRACTION = 0.50
 MAX_RISK_FRACTION = 0.90
@@ -366,6 +369,9 @@ class TradingBot:
         capital = fiat_balance * max(0.0, min(1.0, fraction))
         if self.simulation:
             volume = round((capital * self.BUY_BUFFER) / price, 6)
+            if volume < MIN_BUY_VOLUME:
+                print(f"⚠️ Buy skipped: volume {volume:.6f} XRP is below minimum {MIN_BUY_VOLUME} XRP")
+                return
             self._sim_crypto = volume
             self._sim_fiat = fiat_balance - (volume * price)
             self.entry_price = price
@@ -375,6 +381,15 @@ class TradingBot:
             fiat_before, _ = self.kraken.get_balance()
             capital = fiat_before * max(0.0, min(1.0, fraction))
             volume = round((capital * self.BUY_BUFFER) / price, 6)
+            if volume < MIN_BUY_VOLUME:
+                msg = (
+                    f"Buy skipped: volume {volume:.6f} XRP is below minimum {MIN_BUY_VOLUME} XRP\n"
+                    f"Fiat: {fiat_before:.2f}, Price: {price:.6f}, Fraction: {fraction:.0%}\n"
+                    f"Time: {datetime.now()}"
+                )
+                print(f"⚠️ {msg}")
+                self.notifier.send("Dmitry Buy Skipped (Min Volume)", msg)
+                return
             response = self.kraken.place_order('buy', volume)
             if not response or response.get('error'):
                 msg = (
