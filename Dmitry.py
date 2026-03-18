@@ -263,6 +263,11 @@ class TradingBot:
         self.peak_price: float = 0.0   # highest price seen while waiting (drives dip detection)
         self.trade_count = 0
         self._dip_notified = False
+        self._min_vol_notified = False
+        self._buy_failed_notified = False
+        self._sell_failed_notified = False
+        self._buy_warn_sent = False
+        self._sell_warn_sent = False
 
         self.price_history: deque = deque(maxlen=PRICE_HISTORY_SIZE)
 
@@ -382,23 +387,35 @@ class TradingBot:
             capital = fiat_before * max(0.0, min(1.0, fraction))
             volume = round((capital * self.BUY_BUFFER) / price, 6)
             if volume < MIN_BUY_VOLUME:
-                msg = (
-                    f"Buy skipped: volume {volume:.6f} XRP is below minimum {MIN_BUY_VOLUME} XRP\n"
-                    f"Fiat: {fiat_before:.2f}, Price: {price:.6f}, Fraction: {fraction:.0%}\n"
-                    f"Time: {datetime.now()}"
-                )
-                print(f"⚠️ {msg}")
-                self.notifier.send("Dmitry Buy Skipped (Min Volume)", msg)
+                if not self._min_vol_notified:
+                    msg = (
+                        f"Buy skipped: volume {volume:.6f} XRP is below minimum {MIN_BUY_VOLUME} XRP\n"
+                        f"Fiat: {fiat_before:.2f}, Price: {price:.6f}, Fraction: {fraction:.0%}\n"
+                        f"Time: {datetime.now()}"
+                    )
+                    print(f"⚠️ {msg}")
+                    self.notifier.send("Dmitry Buy Skipped (Min Volume)", msg)
+                    self._min_vol_notified = True
+                else:
+                    print(f"⚠️ Buy skipped: volume {volume:.6f} XRP below minimum {MIN_BUY_VOLUME} XRP (email already sent)")
                 return
+            self._min_vol_notified = False
             response = self.kraken.place_order('buy', volume)
             if not response or response.get('error'):
-                msg = (
-                    f"Buy order failed!\nVolume: {volume}\nFiat Before: {fiat_before:.2f}\n"
-                    f"Pair: {PAIR}\nResponse: {response}\nTime: {datetime.now()}"
-                )
-                print("⚠️ " + msg)
-                self.notifier.send("Dmitry Buy Order Failed", msg)
+                if not self._buy_failed_notified:
+                    msg = (
+                        f"Buy order failed!\nVolume: {volume}\nFiat Before: {fiat_before:.2f}\n"
+                        f"Pair: {PAIR}\nResponse: {response}\nTime: {datetime.now()}"
+                    )
+                    print("⚠️ " + msg)
+                    self.notifier.send("Dmitry Buy Order Failed", msg)
+                    self._buy_failed_notified = True
+                else:
+                    print(f"⚠️ Buy order failed again (email already sent). Response: {response}")
                 return
+            self._buy_failed_notified = False
+            print("⏳ Waiting 60s for buy order to settle...")
+            time.sleep(60)
             fiat_after, crypto_after = self.kraken.get_balance()
             if fiat_after is None or crypto_after is None:
                 fiat_after, crypto_after = self.kraken.get_balance()
@@ -431,8 +448,15 @@ class TradingBot:
                 return
             response = self.kraken.place_order('sell', crypto_balance)
             if not response or response.get('error'):
-                self.notifier.send("Dmitry sell failed", "⚠️ Sell order failed.")
+                if not self._sell_failed_notified:
+                    self.notifier.send("Dmitry sell failed", f"⚠️ Sell order failed.\nResponse: {response}\nTime: {datetime.now()}")
+                    self._sell_failed_notified = True
+                else:
+                    print(f"⚠️ Sell order failed again (email already sent). Response: {response}")
                 return
+            self._sell_failed_notified = False
+            print("⏳ Waiting 60s for sell order to settle...")
+            time.sleep(60)
             fiat_after, crypto_after = self.kraken.get_balance()
             fiat_display = fiat_after or 0.0
             crypto_display = crypto_after or 0.0
@@ -511,17 +535,27 @@ class TradingBot:
                         ))
                     elif not dip_triggered:
                         self._dip_notified = False
+                        self._min_vol_notified = False
+                        self._buy_failed_notified = False
+                        self._buy_warn_sent = False
 
                     if dip_triggered and regime_ok and vol_ok and fiat > 1:
                         pre_fiat, _ = self._get_balance()
                         self._buy(fiat, price, fraction=fraction, regime=regime)
                         post_fiat, _ = self._get_balance()
                         if abs(pre_fiat - post_fiat) < 1e-6:
-                            self.notifier.send("Dmitry Warning", "Buy may have failed — still in waiting mode.")
+                            if not self._buy_warn_sent:
+                                self.notifier.send("Dmitry Warning", "Buy may have failed — still in waiting mode.")
+                                self._buy_warn_sent = True
+                            else:
+                                print("⚠️ Buy may have failed (warning email already sent)")
                         else:
                             self.mode = 'holding'
                             self.peak_price = price
                             self._dip_notified = False
+                            self._min_vol_notified = False
+                            self._buy_failed_notified = False
+                            self._buy_warn_sent = False
 
                 elif self.mode == 'holding' and self.entry_price:
                     self.entry_high = max(self.entry_high, price)
@@ -534,10 +568,16 @@ class TradingBot:
                         self._sell(crypto, price, reason=reason)
                         _, post_crypto = self._get_balance()
                         if abs(pre_crypto - post_crypto) < 1e-6:
-                            self.notifier.send("Dmitry Warning", f"Sell ({reason}) may have failed.")
+                            if not self._sell_warn_sent:
+                                self.notifier.send("Dmitry Warning", f"Sell ({reason}) may have failed.")
+                                self._sell_warn_sent = True
+                            else:
+                                print(f"⚠️ Sell ({reason}) may have failed (warning email already sent)")
                         else:
                             self.mode = 'waiting'
                             self.peak_price = price
+                            self._sell_failed_notified = False
+                            self._sell_warn_sent = False
 
                 time.sleep(1)
 
