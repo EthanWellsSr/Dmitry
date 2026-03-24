@@ -35,7 +35,7 @@ EMA_SLOPE_LOOKBACK = 10
 # ATR-based trailing stop
 ATR_PERIOD = 14
 ATR_STOP_MULT = 2.0          # stop = entry_high - (ATR_STOP_MULT * atr)
-TRAILING_STOP_PCT = 0.018    # fallback when ATR history not yet available
+TRAILING_STOP_PCT = 0.05     # min 5% dip from entry before stop triggers
 
 # Consecutive trailing-stop circuit breaker
 CONSECUTIVE_STOP_LIMIT = 3   # number of trailing stops before cooldown
@@ -624,10 +624,12 @@ class TradingBot:
                     atr = self._atr(self.active_pair)
 
                     take_profit = price >= self.entry_price * (1 + sell_rise)
+                    stop_floor = self.entry_price * (1 - TRAILING_STOP_PCT)
                     if atr is not None:
-                        trailing_stop = price <= self.entry_high - ATR_STOP_MULT * atr
+                        atr_stop = self.entry_high - ATR_STOP_MULT * atr
+                        trailing_stop = price <= min(atr_stop, stop_floor)
                     else:
-                        trailing_stop = price <= self.entry_high * (1 - TRAILING_STOP_PCT)
+                        trailing_stop = price <= stop_floor
 
                     if take_profit or trailing_stop:
                         reason = 'take-profit' if take_profit else 'trailing-stop'
