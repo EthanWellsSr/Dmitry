@@ -30,12 +30,14 @@ EMA_SLOW_PERIODS = [100, 200, 400]        # EMA20 is scored against all three
 PRICE_HISTORY_SIZE = max(EMA_SLOW_PERIODS) + 5
 
 # EMA slope filter: EMA_FAST must be rising over this many ticks to confirm uptrend
-EMA_SLOPE_LOOKBACK = 10
+EMA_SLOPE_LOOKBACK = 60          # ticks to look back when checking EMA slope (60s gives meaningful trend signal)
 
 # ATR-based trailing stop
 ATR_PERIOD = 14
 ATR_STOP_MULT = 2.0          # stop = entry_high - (ATR_STOP_MULT * atr)
-TRAILING_STOP_PCT = 0.05     # min 5% dip from entry before stop triggers
+TRAILING_STOP_PCT = 0.05     # hard floor: max 5% loss from entry
+MIN_ATR_STOP_PCT = 0.015     # minimum stop distance: 1.5% below entry_high (prevents hair-trigger stops from tiny 1-second ATR)
+MIN_HOLD_SECONDS = 900       # trailing stop cannot fire within 15 min of entry (take-profit can exit anytime)
 
 # Consecutive trailing-stop circuit breaker
 CONSECUTIVE_STOP_LIMIT = 3   # number of trailing stops before cooldown
@@ -51,6 +53,9 @@ MIN_BUY_DIP = 0.004          # floor: require at least 0.4% dip from peak
 VOL_DIP_MULT = 1.5           # buy_dip  = max(MIN_BUY_DIP,  vol * VOL_DIP_MULT)
 MIN_SELL_RISE = 0.010        # floor: require at least 1.0% rise (covers fees + slippage)
 VOL_SELL_MULT = 2.0          # sell_rise = max(MIN_SELL_RISE, vol * VOL_SELL_MULT)
+
+# Dip reversal confirmation: price must bounce this much off the dip low before entry
+BOUNCE_CONFIRMATION_PCT = 0.005  # 0.5% bounce required — confirms dip has reversed, not still falling
 
 # Minimum order size per pair (Kraken requirements)
 MIN_BUY_VOLUME = {
@@ -297,6 +302,10 @@ class TradingBot:
             pair: deque(maxlen=PRICE_HISTORY_SIZE) for pair in PAIRS
         }
         self.pair_peaks: dict[str, float] = {pair: 0.0 for pair in PAIRS}
+        self.pair_dip_lows: dict[str, float] = {pair: 0.0 for pair in PAIRS}
+
+        # Entry timing (used to enforce MIN_HOLD_SECONDS before trailing stop can fire)
+        self.entry_time: Optional[datetime] = None
 
         # Circuit breaker state
         self.consecutive_stops: int = 0
@@ -441,6 +450,9 @@ class TradingBot:
                     self.entry_price = self.kraken.get_last_buy_price(pair)
                     if self.entry_price:
                         self.entry_high = self.entry_price
+                        # Set entry_time far enough in the past so the trailing stop can fire immediately if needed.
+                        # We don't know the real entry time after a restart.
+                        self.entry_time = datetime.now() - timedelta(seconds=MIN_HOLD_SECONDS)
                         print(f"🔁 Recovered: holding {pair}, crypto={crypto:.6f}, entry={self.entry_price:.6f}")
                         return
                     print(f"⚠️ Buy price recovery attempt {attempt + 1}/3 failed")
@@ -517,6 +529,7 @@ class TradingBot:
             fiat_display, crypto_display = fiat_after, crypto_after
 
         self.entry_high = self.entry_price
+        self.entry_time = datetime.now()
         self.logger.log("BUY", actual_price, volume, fiat_display, crypto_display,
                         note=f"pair={pair}, regime={regime}, frac={fraction:.0%}")
         self.notifier.send("Dmitry made a buy!", (
@@ -564,6 +577,7 @@ class TradingBot:
         self.active_pair = None
         self.entry_price = None
         self.entry_high = 0.0
+        self.entry_time = None
         self.trade_count += 1
         self.logger.log("SELL", price, crypto_balance, fiat_display, crypto_display,
                         note=f"{reason}, pair={pair}")
@@ -626,10 +640,20 @@ class TradingBot:
                     take_profit = price >= self.entry_price * (1 + sell_rise)
                     stop_floor = self.entry_price * (1 - TRAILING_STOP_PCT)
                     if atr is not None:
-                        atr_stop = self.entry_high - ATR_STOP_MULT * atr
-                        trailing_stop = price <= min(atr_stop, stop_floor)
+                        # Use whichever ATR distance is larger: computed ATR or the minimum 1.5% floor.
+                        # This prevents hair-trigger stops caused by tiny per-second ATR values.
+                        atr_distance = max(ATR_STOP_MULT * atr, self.entry_high * MIN_ATR_STOP_PCT)
+                        atr_stop = self.entry_high - atr_distance
+                        # Trigger if EITHER the trailing ATR stop OR the hard floor is breached (OR logic = max).
+                        trailing_stop = price <= max(atr_stop, stop_floor)
                     else:
                         trailing_stop = price <= stop_floor
+
+                    # Don't allow trailing stop to fire within MIN_HOLD_SECONDS of entry.
+                    # Take-profit can still exit immediately.
+                    time_held = (now - self.entry_time).total_seconds() if self.entry_time else MIN_HOLD_SECONDS
+                    if trailing_stop and time_held < MIN_HOLD_SECONDS:
+                        trailing_stop = False
 
                     if take_profit or trailing_stop:
                         reason = 'take-profit' if take_profit else 'trailing-stop'
@@ -704,7 +728,19 @@ class TradingBot:
 
                         if dip_pct < buy_dip:
                             self._dip_notified[pair] = False
+                            self.pair_dip_lows[pair] = 0.0  # reset: price is not in dip territory
                             continue
+
+                        # Track the lowest point during this dip
+                        if not self.pair_dip_lows[pair] or price < self.pair_dip_lows[pair]:
+                            self.pair_dip_lows[pair] = price
+
+                        # Require a confirmed bounce off the dip low before entering.
+                        # Prevents buying into a continuing downtrend.
+                        dip_low = self.pair_dip_lows[pair]
+                        bounce_pct = (price - dip_low) / dip_low if dip_low else 0.0
+                        if bounce_pct < BOUNCE_CONFIRMATION_PCT:
+                            continue  # still falling or flat — wait for reversal
 
                         # Known regimes rank above 'unknown' (startup warmup fallback)
                         effective_score = score if regime != 'unknown' else -1
@@ -750,6 +786,7 @@ class TradingBot:
                             self.mode = 'holding'
                             self.active_pair = best_pair
                             self.pair_peaks[best_pair] = price
+                            self.pair_dip_lows[best_pair] = 0.0
                             self._dip_notified[best_pair] = False
                             self._min_vol_notified = False
                             self._buy_failed_notified = False
