@@ -24,40 +24,63 @@ PAIRS = {
     'SOLUSD':   'SOL',
 }
 
-# EMA periods for trend / regime detection
-EMA_FAST_PERIOD = 20
-EMA_SLOW_PERIODS = [100, 200, 400]        # EMA20 is scored against all three
-PRICE_HISTORY_SIZE = max(EMA_SLOW_PERIODS) + 5
+# ---- Candle settings ----
+# All indicators (EMA, RSI, ATR, vol) use 1-minute OHLC candles from Kraken.
+# This prevents the noise that plagued tick-based EMAs (where EMA20 = 20 seconds).
+CANDLE_INTERVAL = 1          # 1-minute candles
+CANDLE_WARMUP = 260          # candles to fetch per pair on startup (~4.3 hours)
+CANDLE_HISTORY_SIZE = 260    # max candles stored per pair
+CANDLE_UPDATE_INTERVAL = 60  # seconds between candle refreshes in the main loop
 
-# EMA slope filter: EMA_FAST must be rising over this many ticks to confirm uptrend
-EMA_SLOPE_LOOKBACK = 60          # ticks to look back when checking EMA slope (60s gives meaningful trend signal)
+# ---- EMA periods (in 1-minute candles = minutes) ----
+EMA_FAST_PERIOD = 20         # 20-minute fast EMA
+EMA_SLOW_PERIODS = [50, 100, 200]  # 50m, ~1.7h, ~3.3h slow EMAs
+EMA_SLOPE_LOOKBACK = 5       # candles to look back when checking EMA slope direction
 
-# ATR-based trailing stop
+# ---- RSI filter ----
+# Research confirms RSI + EMA outperforms EMA alone for dip-buying.
+# Only enter when RSI < RSI_MAX_ENTRY (price has pulled back, not overbought).
+RSI_PERIOD = 14
+RSI_MAX_ENTRY = 50           # skip entry if RSI >= 50 on 1-minute chart
+
+# ---- ATR trailing stop (on 1-minute true-range candles) ----
+# 2.5x ATR is the research-backed sweet spot for intraday crypto.
 ATR_PERIOD = 14
-ATR_STOP_MULT = 2.0          # stop = entry_high - (ATR_STOP_MULT * atr)
-TRAILING_STOP_PCT = 0.05     # hard floor: max 5% loss from entry
-MIN_ATR_STOP_PCT = 0.015     # minimum stop distance: 1.5% below entry_high (prevents hair-trigger stops from tiny 1-second ATR)
-MIN_HOLD_SECONDS = 900       # trailing stop cannot fire within 15 min of entry (take-profit can exit anytime)
+ATR_STOP_MULT = 2.5
+TRAILING_STOP_PCT = 0.05     # emergency floor: max 5% loss from entry price
+MIN_ATR_STOP_PCT = 0.010     # minimum stop buffer: 1% below entry_high
+                              # (prevents stop inside spread noise; gives ~1.5:1 R:R vs 1.5% TP)
 
-# Consecutive trailing-stop circuit breaker
-CONSECUTIVE_STOP_LIMIT = 3   # number of trailing stops before cooldown
-COOLDOWN_HOURS = 4           # how long to pause after hitting the limit
+# Trailing stop cannot fire within this many seconds of entry.
+# Take-profit can still exit anytime.
+MIN_HOLD_SECONDS = 1800      # 30 minutes (up from 15 — gives trades time to develop)
 
-# Volatility
-VOL_LOOKBACK = 30
-MAX_ENTRY_VOL = 0.04         # skip entry if realized vol is too high (chaotic market)
-TARGET_VOL = 0.015           # reference vol for full base-size deployment
+# ---- Circuit breaker ----
+CONSECUTIVE_STOP_LIMIT = 2   # 2 consecutive trailing stops trigger cooldown
+COOLDOWN_HOURS = 6
 
-# Dynamic entry/exit thresholds (scale with realized volatility)
-MIN_BUY_DIP = 0.004          # floor: require at least 0.4% dip from peak
-VOL_DIP_MULT = 1.5           # buy_dip  = max(MIN_BUY_DIP,  vol * VOL_DIP_MULT)
-MIN_SELL_RISE = 0.010        # floor: require at least 1.0% rise (covers fees + slippage)
-VOL_SELL_MULT = 2.0          # sell_rise = max(MIN_SELL_RISE, vol * VOL_SELL_MULT)
+# Time-of-day filter (UTC hours). Avoid entries during low-liquidity windows.
+# Research: spread widens significantly between 22:00–02:00 UTC for crypto.
+# All 5 rapid-fire losses on 2026-03-25 occurred at 02:51–03:00 UTC.
+LOW_LIQUIDITY_START_UTC = 22  # inclusive
+LOW_LIQUIDITY_END_UTC = 2     # exclusive (so block 22, 23, 0, 1)
 
-# Dip reversal confirmation: price must bounce this much off the dip low before entry
-BOUNCE_CONFIRMATION_PCT = 0.005  # 0.5% bounce required — confirms dip has reversed, not still falling
+# ---- Volatility (per 1-minute candle average absolute return) ----
+VOL_LOOKBACK = 20            # candles
+MAX_ENTRY_VOL = 0.006        # skip entry if avg per-candle move > 0.6%
+TARGET_VOL = 0.003           # reference vol for full position sizing
 
-# Minimum order size per pair (Kraken requirements)
+# ---- Entry thresholds ----
+MIN_BUY_DIP = 0.004          # price must be >= 0.4% below rolling 20-candle peak
+VOL_DIP_MULT = 1.0
+MIN_SELL_RISE = 0.015        # 1.5% take-profit floor
+VOL_SELL_MULT = 1.5
+
+# Bounce confirmation: require this many consecutive rising candle closes before entry.
+# Replaces the old 0.5%-bounce hack — candle closes are far more reliable.
+BOUNCE_CANDLES_REQUIRED = 2
+
+# ---- Minimum order sizes (Kraken requirements) ----
 MIN_BUY_VOLUME = {
     'XXRPZUSD': 1.0,
     'XETHZUSD': 0.002,
@@ -65,22 +88,22 @@ MIN_BUY_VOLUME = {
     'SOLUSD':   0.02,
 }
 
-# Position sizing (fraction of fiat deployed per trade, scales inversely with vol)
-BASE_RISK_FRACTION = 0.50
+# ---- Position sizing ----
+BASE_RISK_FRACTION = 0.90
 MAX_RISK_FRACTION = 0.90
-MIN_RISK_FRACTION = 0.20
+MIN_RISK_FRACTION = 0.25
 
-# Google Sheets
+# ---- Google Sheets ----
 GOOGLE_KEY_FILE = 'google_key.json'
 GOOGLE_SHEET_NAME = 'Dmitry_trades'
 
-# Email alerts
+# ---- Email alerts ----
 EMAIL_ALERTS = True
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 SEND_STARTUP_EMAIL = True
 
-# Heartbeat
+# ---- Heartbeat ----
 HEARTBEAT_ENABLED = True
 HEARTBEAT_SUBJECT = "Dmitry Heartbeat"
 HEARTBEAT_BODY = "Dmitry is still running."
@@ -212,7 +235,7 @@ class KrakenClient:
         return None
 
     def get_prices(self) -> dict[str, float]:
-        """Fetch current prices for all pairs in one API call."""
+        """Fetch current bid prices for all pairs in one API call."""
         res = self._call('public', 'Ticker', {'pair': ','.join(PAIRS.keys())})
         if not res or 'result' not in res:
             return {}
@@ -221,6 +244,23 @@ class KrakenClient:
             for pair, data in res['result'].items()
             if pair in PAIRS
         }
+
+    def get_ohlc(self, pair: str, interval: int = 1, since: int = None) -> list:
+        """
+        Fetch OHLC candle data from Kraken.
+        Returns list of [time, open, high, low, close, vwap, volume, count].
+        The last entry is always the current (incomplete) candle — callers should skip it.
+        """
+        params = {'pair': pair, 'interval': interval}
+        if since is not None:
+            params['since'] = since
+        res = self._call('public', 'OHLC', params)
+        if not res or 'result' not in res:
+            return []
+        for key, val in res['result'].items():
+            if key != 'last' and isinstance(val, list):
+                return val
+        return []
 
     def get_all_balances(self) -> dict[str, float]:
         now = time.time()
@@ -297,12 +337,11 @@ class TradingBot:
         self.entry_high: float = 0.0
         self.trade_count = 0
 
-        # Per-pair price history and dip tracking
-        self.pair_histories: dict[str, deque] = {
-            pair: deque(maxlen=PRICE_HISTORY_SIZE) for pair in PAIRS
+        # 1-minute OHLC candle histories per pair (dicts with t/o/h/l/c/v keys)
+        self.candle_histories: dict[str, deque] = {
+            pair: deque(maxlen=CANDLE_HISTORY_SIZE) for pair in PAIRS
         }
-        self.pair_peaks: dict[str, float] = {pair: 0.0 for pair in PAIRS}
-        self.pair_dip_lows: dict[str, float] = {pair: 0.0 for pair in PAIRS}
+        self.last_candle_update: float = 0.0
 
         # Entry timing (used to enforce MIN_HOLD_SECONDS before trailing stop can fire)
         self.entry_time: Optional[datetime] = None
@@ -323,79 +362,183 @@ class TradingBot:
         self._sim_fiat = 1000.0
         self._sim_crypto = 0.0
 
+        # Warm up candle histories BEFORE recovery so ATR/EMAs are ready immediately.
+        # This is especially important when restarting with an open position.
+        if not self.simulation:
+            self._warmup_candles()
+
         self._recover_state()
 
-    # ----- BALANCE -----
+    # ----- CANDLE DATA -----
 
-    def _get_balance(self, crypto_key: str = '') -> tuple[float, float]:
-        if self.simulation:
-            return self._sim_fiat, self._sim_crypto
-        return self.kraken.get_balance(crypto_key)
+    def _warmup_candles(self):
+        """Fetch CANDLE_WARMUP historical 1-minute candles per pair from Kraken on startup."""
+        since = int(time.time()) - (CANDLE_WARMUP + 15) * CANDLE_INTERVAL * 60
+        print(f"📊 Warming up {CANDLE_WARMUP} candles per pair (~{CANDLE_WARMUP} minutes of history)...")
+        for pair in PAIRS:
+            raw = self.kraken.get_ohlc(pair, CANDLE_INTERVAL, since=since)
+            if not raw:
+                print(f"  ⚠️ Candle warmup failed for {pair}")
+                continue
+            # Skip the last entry — it's the current (incomplete) candle
+            for row in raw[:-1]:
+                self.candle_histories[pair].append({
+                    't': int(row[0]),
+                    'o': float(row[1]),
+                    'h': float(row[2]),
+                    'l': float(row[3]),
+                    'c': float(row[4]),
+                    'v': float(row[6]),
+                })
+            n = len(self.candle_histories[pair])
+            print(f"  {pair}: {n} candles loaded (EMA200 needs 200; have {'✅' if n >= 200 else f'⚠️ only {n}'})")
+            time.sleep(0.5)  # avoid Kraken rate limit
+        self.last_candle_update = time.time()
 
-    # ----- INDICATORS -----
+    def _update_candles(self):
+        """Append any new completed 1-minute candles. Called every CANDLE_UPDATE_INTERVAL seconds."""
+        for pair in PAIRS:
+            hist = self.candle_histories[pair]
+            since = hist[-1]['t'] if hist else int(time.time()) - 180
+            raw = self.kraken.get_ohlc(pair, CANDLE_INTERVAL, since=since)
+            if not raw or len(raw) < 2:
+                continue
+            # Skip the last entry (current incomplete candle)
+            for row in raw[:-1]:
+                candle_t = int(row[0])
+                if hist and hist[-1]['t'] >= candle_t:
+                    continue  # already stored
+                hist.append({
+                    't': candle_t,
+                    'o': float(row[1]),
+                    'h': float(row[2]),
+                    'l': float(row[3]),
+                    'c': float(row[4]),
+                    'v': float(row[6]),
+                })
+        self.last_candle_update = time.time()
 
-    def _ema(self, period: int, pair: str) -> Optional[float]:
-        history = self.pair_histories[pair]
-        if len(history) < period:
+    # ----- INDICATORS (all candle-based) -----
+
+    def _ema_from_candles(self, period: int, pair: str) -> Optional[float]:
+        """EMA computed over all available candle close prices for maximum accuracy."""
+        hist = self.candle_histories[pair]
+        if len(hist) < period:
             return None
-        values = list(history)[-period:]
+        closes = [c['c'] for c in hist]
         k = 2 / (period + 1)
-        ema = values[0]
-        for v in values[1:]:
+        ema = closes[0]
+        for v in closes[1:]:
             ema = v * k + ema * (1 - k)
         return ema
 
-    def _realized_vol(self, pair: str) -> Optional[float]:
-        history = self.pair_histories[pair]
-        if len(history) < VOL_LOOKBACK + 1:
+    def _rsi(self, pair: str) -> Optional[float]:
+        """RSI(14) on 1-minute candle closes. Only enter when RSI < RSI_MAX_ENTRY."""
+        hist = self.candle_histories[pair]
+        need = RSI_PERIOD + 1
+        if len(hist) < need:
             return None
-        values = list(history)[-(VOL_LOOKBACK + 1):]
-        returns = [abs((values[i] - values[i - 1]) / values[i - 1]) for i in range(1, len(values)) if values[i - 1] > 0]
+        closes = [c['c'] for c in list(hist)[-need:]]
+        gains, losses = [], []
+        for i in range(1, len(closes)):
+            diff = closes[i] - closes[i - 1]
+            gains.append(max(diff, 0.0))
+            losses.append(max(-diff, 0.0))
+        avg_gain = sum(gains) / RSI_PERIOD
+        avg_loss = sum(losses) / RSI_PERIOD
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
+
+    def _true_atr(self, pair: str) -> Optional[float]:
+        """
+        True Average True Range on 1-minute candles.
+        True range = max(H-L, |H-prevClose|, |L-prevClose|).
+        Far more accurate than the old close-to-close tick ATR.
+        """
+        hist = self.candle_histories[pair]
+        need = ATR_PERIOD + 1
+        if len(hist) < need:
+            return None
+        candles = list(hist)[-need:]
+        trs = []
+        for i in range(1, len(candles)):
+            h = candles[i]['h']
+            l = candles[i]['l']
+            pc = candles[i - 1]['c']
+            trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+        return sum(trs) / len(trs)
+
+    def _candle_vol(self, pair: str) -> Optional[float]:
+        """Average absolute per-candle return over VOL_LOOKBACK candles."""
+        hist = self.candle_histories[pair]
+        need = VOL_LOOKBACK + 1
+        if len(hist) < need:
+            return None
+        candles = list(hist)[-need:]
+        returns = []
+        for i in range(1, len(candles)):
+            pc = candles[i - 1]['c']
+            cc = candles[i]['c']
+            if pc > 0:
+                returns.append(abs((cc - pc) / pc))
         return sum(returns) / len(returns) if returns else None
 
-    def _atr(self, pair: str) -> Optional[float]:
-        """Approximate ATR using close-to-close absolute price moves."""
-        history = self.pair_histories[pair]
-        if len(history) < ATR_PERIOD + 1:
+    def _candle_slope_rising(self, pair: str) -> Optional[bool]:
+        """True if EMA_FAST is higher now than EMA_SLOPE_LOOKBACK candles ago."""
+        hist = self.candle_histories[pair]
+        need = EMA_FAST_PERIOD + EMA_SLOPE_LOOKBACK
+        if len(hist) < need:
             return None
-        values = list(history)[-(ATR_PERIOD + 1):]
-        return sum(abs(values[i] - values[i - 1]) for i in range(1, len(values))) / ATR_PERIOD
-
-    def _ema_slope_rising(self, pair: str) -> Optional[bool]:
-        """
-        True if EMA_FAST is higher now than EMA_SLOPE_LOOKBACK ticks ago.
-        Returns None if not enough data yet.
-        """
-        history = self.pair_histories[pair]
-        if len(history) < EMA_FAST_PERIOD + EMA_SLOPE_LOOKBACK:
-            return None
-        values = list(history)
+        candles = list(hist)
         k = 2 / (EMA_FAST_PERIOD + 1)
 
-        recent = values[-EMA_FAST_PERIOD:]
+        recent = [c['c'] for c in candles[-EMA_FAST_PERIOD:]]
         ema_now = recent[0]
         for v in recent[1:]:
             ema_now = v * k + ema_now * (1 - k)
 
-        past = values[-(EMA_FAST_PERIOD + EMA_SLOPE_LOOKBACK):-EMA_SLOPE_LOOKBACK]
+        past_end = len(candles) - EMA_SLOPE_LOOKBACK
+        past = [c['c'] for c in candles[past_end - EMA_FAST_PERIOD:past_end]]
         ema_past = past[0]
         for v in past[1:]:
             ema_past = v * k + ema_past * (1 - k)
 
         return ema_now > ema_past
 
+    def _has_bounce_confirmation(self, pair: str) -> bool:
+        """
+        Require BOUNCE_CANDLES_REQUIRED consecutive higher candle closes.
+        Far more reliable than the old 0.5% price-tick bounce hack.
+        """
+        hist = self.candle_histories[pair]
+        need = BOUNCE_CANDLES_REQUIRED + 1
+        if len(hist) < need:
+            return False
+        recent = [c['c'] for c in list(hist)[-need:]]
+        return all(recent[i] > recent[i - 1] for i in range(1, len(recent)))
+
+    def _rolling_peak(self, pair: str, lookback: int = 20) -> Optional[float]:
+        """Highest close price among the last `lookback` candles."""
+        hist = self.candle_histories[pair]
+        if len(hist) < lookback:
+            if len(hist) == 0:
+                return None
+            lookback = len(hist)
+        return max(c['c'] for c in list(hist)[-lookback:])
+
+    # ----- REGIME & THRESHOLDS -----
+
     def _market_regime(self, ema_fast: Optional[float], slow_emas: list[Optional[float]], pair: str) -> tuple[str, int]:
         """
-        Scores EMA20 against each of EMA100, EMA200, EMA400.
-        +1 for each slow EMA that EMA20 is above.
+        Scores EMA_FAST against each slow EMA (computed on 1-minute candles).
+        +1 for each slow EMA that EMA_FAST is above.
+        EMA slope downgrade: if EMA_FAST is falling, subtract 1.
 
-        If EMA20 slope is falling, score is reduced by 1 (downgrade regime).
-
-        Score 3 -> bull       (enter, full sizing)
-        Score 2 -> mild-bull  (enter, normal sizing)
-        Score 1 -> caution    (skip)
-        Score 0 -> bear       (skip)
-        unknown -> not enough history yet
+        Score == len(slow_emas) -> bull       (enter)
+        Score == len(slow_emas)-1 -> mild-bull (skipped — too risky in real markets)
+        Score <= len(slow_emas)-2 -> caution/bear (skip)
         """
         if ema_fast is None:
             return 'unknown', -1
@@ -405,8 +548,7 @@ class TradingBot:
 
         score = sum(1 for s in available if ema_fast > s)
 
-        # EMA slope filter: a falling EMA20 downgrades the regime by one step
-        slope_rising = self._ema_slope_rising(pair)
+        slope_rising = self._candle_slope_rising(pair)
         if slope_rising is False:
             score = max(0, score - 1)
 
@@ -426,12 +568,24 @@ class TradingBot:
     def _position_fraction(self, vol: Optional[float]) -> float:
         if vol is None:
             return BASE_RISK_FRACTION
-        fraction = BASE_RISK_FRACTION * (TARGET_VOL / max(vol, 0.001))
+        fraction = BASE_RISK_FRACTION * (TARGET_VOL / max(vol, 0.0001))
         return min(MAX_RISK_FRACTION, max(MIN_RISK_FRACTION, fraction))
+
+    # ----- BALANCE -----
+
+    def _get_balance(self, crypto_key: str = '') -> tuple[float, float]:
+        if self.simulation:
+            return self._sim_fiat, self._sim_crypto
+        return self.kraken.get_balance(crypto_key)
 
     # ----- RECOVERY -----
 
     def _recover_state(self):
+        """
+        On startup, check if we already hold a position from a previous run.
+        Because _warmup_candles() was called first, candle indicators are ready
+        and the ATR/stop calculations will be accurate from tick 1.
+        """
         if self.simulation:
             self.mode = 'waiting'
             print(f"🔁 Recovered: waiting (simulation), fiat={self._sim_fiat:.2f}")
@@ -450,10 +604,14 @@ class TradingBot:
                     self.entry_price = self.kraken.get_last_buy_price(pair)
                     if self.entry_price:
                         self.entry_high = self.entry_price
-                        # Set entry_time far enough in the past so the trailing stop can fire immediately if needed.
-                        # We don't know the real entry time after a restart.
+                        # Set entry_time far enough in the past so the trailing stop
+                        # can fire if the position has already moved against us.
+                        # The 30-min hold time is waived on recovery — we don't know
+                        # how long this position has been open.
                         self.entry_time = datetime.now() - timedelta(seconds=MIN_HOLD_SECONDS)
                         print(f"🔁 Recovered: holding {pair}, crypto={crypto:.6f}, entry={self.entry_price:.6f}")
+                        atr = self._true_atr(pair)
+                        print(f"   ATR(14) on 1m candles: {atr:.6f}" if atr else "   ATR not yet available")
                         return
                     print(f"⚠️ Buy price recovery attempt {attempt + 1}/3 failed")
                     if attempt < 2:
@@ -592,7 +750,16 @@ class TradingBot:
 
     def run(self):
         if SEND_STARTUP_EMAIL:
-            self.notifier.send("Dmitry Started", "Dmitry just started successfully.")
+            self.notifier.send("Dmitry Started", (
+                "Dmitry just started successfully.\n\n"
+                "Key changes in this version:\n"
+                "- All indicators now use 1-minute OHLC candles (not 1-second ticks)\n"
+                "- RSI(14) filter added: only enter when RSI < 50\n"
+                "- Bull regime required: EMA20 > EMA50 > EMA100 > EMA200 (all on 1-minute)\n"
+                "- Bounce confirmation: 2 consecutive higher candle closes required\n"
+                "- Min hold time: 30 minutes\n"
+                "- Stop floor: 1% below entry high (up from 1.5%)\n"
+            ))
 
         next_heartbeat = _next_top_of_hour()
 
@@ -604,14 +771,15 @@ class TradingBot:
                     self.notifier.send(HEARTBEAT_SUBJECT, f"{HEARTBEAT_BODY}\nTime: {now}")
                     next_heartbeat = _next_top_of_hour(now)
 
+                # Refresh candle data every CANDLE_UPDATE_INTERVAL seconds.
+                # This keeps EMAs, RSI, and ATR current without hammering the API.
+                if not self.simulation and (time.time() - self.last_candle_update >= CANDLE_UPDATE_INTERVAL):
+                    self._update_candles()
+
                 prices = self.kraken.get_prices()
                 if not prices:
                     time.sleep(2)
                     continue
-
-                # Update all pair price histories every tick (keeps EMAs warm)
-                for pair, price in prices.items():
-                    self.pair_histories[pair].append(price)
 
                 # ----- HOLDING MODE -----
 
@@ -633,31 +801,31 @@ class TradingBot:
                         continue
 
                     self.entry_high = max(self.entry_high, price)
-                    vol = self._realized_vol(self.active_pair)
+                    vol = self._candle_vol(self.active_pair)
                     _, sell_rise = self._dynamic_thresholds(vol)
-                    atr = self._atr(self.active_pair)
+                    atr = self._true_atr(self.active_pair)
 
                     take_profit = price >= self.entry_price * (1 + sell_rise)
                     stop_floor = self.entry_price * (1 - TRAILING_STOP_PCT)
+
                     if atr is not None:
-                        # Use whichever ATR distance is larger: computed ATR or the minimum 1.5% floor.
-                        # This prevents hair-trigger stops caused by tiny per-second ATR values.
+                        # Use whichever ATR distance is larger: computed ATR or the 1% floor.
+                        # 1-minute ATR is meaningful (unlike old 14-second ATR) so 2.5x is real.
                         atr_distance = max(ATR_STOP_MULT * atr, self.entry_high * MIN_ATR_STOP_PCT)
                         atr_stop = self.entry_high - atr_distance
-                        # Trigger if EITHER the trailing ATR stop OR the hard floor is breached (OR logic = max).
                         trailing_stop = price <= max(atr_stop, stop_floor)
                     else:
                         trailing_stop = price <= stop_floor
 
-                    # Don't allow trailing stop to fire within MIN_HOLD_SECONDS of entry.
-                    # Take-profit can still exit immediately.
+                    # Trailing stop cannot fire within MIN_HOLD_SECONDS of entry.
+                    # Take-profit can still exit anytime.
                     time_held = (now - self.entry_time).total_seconds() if self.entry_time else MIN_HOLD_SECONDS
                     if trailing_stop and time_held < MIN_HOLD_SECONDS:
                         trailing_stop = False
 
                     if take_profit or trailing_stop:
                         reason = 'take-profit' if take_profit else 'trailing-stop'
-                        pair_selling = self.active_pair  # capture before _sell clears it
+                        pair_selling = self.active_pair
                         crypto_key = PAIRS[pair_selling]
                         _, pre_crypto = self._get_balance(crypto_key)
                         self._sell(pair_selling, pre_crypto, price, reason=reason)
@@ -670,7 +838,6 @@ class TradingBot:
                             else:
                                 print(f"⚠️ Sell ({reason}) may have failed (warning email already sent)")
                         else:
-                            # Update circuit breaker
                             if reason == 'trailing-stop':
                                 self.consecutive_stops += 1
                                 if self.consecutive_stops >= CONSECUTIVE_STOP_LIMIT:
@@ -684,14 +851,11 @@ class TradingBot:
                                     self.notifier.send("Dmitry Circuit Breaker", msg)
                             else:
                                 self.consecutive_stops = 0
-
-                            self.pair_peaks[pair_selling] = price
                             self._sell_warn_sent = False
 
                 # ----- WAITING MODE -----
 
                 elif self.mode == 'waiting':
-                    # Check circuit breaker cooldown
                     if self.cooldown_until:
                         if now >= self.cooldown_until:
                             print(f"▶ Cooldown expired. Resuming trading.")
@@ -701,9 +865,18 @@ class TradingBot:
                             time.sleep(1)
                             continue
 
+                    # Time-of-day filter: skip entries during low-liquidity hours (UTC).
+                    # Spreads widen and thin order books produce noise-based false signals.
+                    utc_hour = datetime.utcnow().hour
+                    in_low_liquidity = (
+                        utc_hour >= LOW_LIQUIDITY_START_UTC or utc_hour < LOW_LIQUIDITY_END_UTC
+                    )
+                    if in_low_liquidity:
+                        time.sleep(1)
+                        continue
+
                     fiat, _ = self._get_balance()
 
-                    # Score all pairs and pick the best candidate
                     best_pair = None
                     best_effective_score = -2
                     best_regime = ''
@@ -712,37 +885,49 @@ class TradingBot:
                         if pair not in prices:
                             continue
                         price = prices[pair]
-                        ema_fast = self._ema(EMA_FAST_PERIOD, pair)
-                        slow_emas = [self._ema(p, pair) for p in EMA_SLOW_PERIODS]
-                        vol = self._realized_vol(pair)
-                        regime, score = self._market_regime(ema_fast, slow_emas, pair)
-                        vol_ok = vol is None or vol <= MAX_ENTRY_VOL
 
-                        if not vol_ok or regime not in ('bull', 'mild-bull', 'unknown'):
+                        # --- Candle-based indicators ---
+                        ema_fast = self._ema_from_candles(EMA_FAST_PERIOD, pair)
+                        slow_emas = [self._ema_from_candles(p, pair) for p in EMA_SLOW_PERIODS]
+                        vol = self._candle_vol(pair)
+                        regime, score = self._market_regime(ema_fast, slow_emas, pair)
+
+                        # Only enter in confirmed bull regime (all EMAs aligned on 1-minute candles).
+                        # This is the single most important filter — it prevents buying in downtrends.
+                        if regime != 'bull':
                             self._dip_notified[pair] = False
                             continue
 
-                        self.pair_peaks[pair] = max(self.pair_peaks[pair], price) if self.pair_peaks[pair] else price
+                        # Skip if volatility is too high (chaotic market)
+                        if vol is not None and vol > MAX_ENTRY_VOL:
+                            self._dip_notified[pair] = False
+                            continue
+
+                        # --- RSI filter ---
+                        # Don't enter if RSI >= RSI_MAX_ENTRY. This ensures we only buy
+                        # when price has genuinely pulled back, not when it's still elevated.
+                        rsi = self._rsi(pair)
+                        if rsi is not None and rsi >= RSI_MAX_ENTRY:
+                            self._dip_notified[pair] = False
+                            continue
+
+                        # --- Dip detection (rolling 20-candle peak) ---
+                        rolling_peak = self._rolling_peak(pair, lookback=20)
+                        if rolling_peak is None:
+                            continue
                         buy_dip, _ = self._dynamic_thresholds(vol)
-                        dip_pct = (self.pair_peaks[pair] - price) / self.pair_peaks[pair]
+                        dip_pct = (rolling_peak - price) / rolling_peak
 
                         if dip_pct < buy_dip:
                             self._dip_notified[pair] = False
-                            self.pair_dip_lows[pair] = 0.0  # reset: price is not in dip territory
                             continue
 
-                        # Track the lowest point during this dip
-                        if not self.pair_dip_lows[pair] or price < self.pair_dip_lows[pair]:
-                            self.pair_dip_lows[pair] = price
+                        # --- Bounce confirmation ---
+                        # Require BOUNCE_CANDLES_REQUIRED consecutive higher candle closes.
+                        # This confirms the dip has reversed and avoids catching a falling knife.
+                        if not self._has_bounce_confirmation(pair):
+                            continue
 
-                        # Require a confirmed bounce off the dip low before entering.
-                        # Prevents buying into a continuing downtrend.
-                        dip_low = self.pair_dip_lows[pair]
-                        bounce_pct = (price - dip_low) / dip_low if dip_low else 0.0
-                        if bounce_pct < BOUNCE_CONFIRMATION_PCT:
-                            continue  # still falling or flat — wait for reversal
-
-                        # Known regimes rank above 'unknown' (startup warmup fallback)
                         effective_score = score if regime != 'unknown' else -1
                         if effective_score > best_effective_score:
                             best_effective_score = effective_score
@@ -751,23 +936,30 @@ class TradingBot:
 
                     if best_pair and fiat > 1:
                         price = prices[best_pair]
-                        vol = self._realized_vol(best_pair)
+                        vol = self._candle_vol(best_pair)
                         fraction = self._position_fraction(vol)
 
                         if not self._dip_notified[best_pair]:
                             self._dip_notified[best_pair] = True
-                            ema_fast = self._ema(EMA_FAST_PERIOD, best_pair)
-                            slow_emas = [self._ema(p, best_pair) for p in EMA_SLOW_PERIODS]
+                            ema_fast = self._ema_from_candles(EMA_FAST_PERIOD, best_pair)
+                            slow_emas = [self._ema_from_candles(p, best_pair) for p in EMA_SLOW_PERIODS]
                             _, score = self._market_regime(ema_fast, slow_emas, best_pair)
-                            ema_labels = [f"EMA{p}={f'{s:.4f}' if s else 'warming'}" for p, s in zip(EMA_SLOW_PERIODS, slow_emas)]
+                            ema_labels = [
+                                f"EMA{p}={f'{s:.4f}' if s else 'warming'}"
+                                for p, s in zip(EMA_SLOW_PERIODS, slow_emas)
+                            ]
                             buy_dip, _ = self._dynamic_thresholds(vol)
-                            dip_pct = (self.pair_peaks[best_pair] - price) / self.pair_peaks[best_pair]
+                            rolling_peak = self._rolling_peak(best_pair, lookback=20) or price
+                            dip_pct = (rolling_peak - price) / rolling_peak
+                            rsi = self._rsi(best_pair)
                             self.notifier.send("Dmitry Dip Triggered", (
-                                f"Pair: {best_pair}\nPrice: {price:.6f}\nPeak: {self.pair_peaks[best_pair]:.6f}\n"
+                                f"Pair: {best_pair}\nPrice: {price:.6f}\n"
+                                f"Rolling Peak (20c): {rolling_peak:.6f}\n"
                                 f"Dip: {dip_pct:.4%} (threshold: {buy_dip:.4%})\n"
+                                f"RSI(14): {f'{rsi:.1f}' if rsi is not None else 'N/A'}\n"
                                 f"EMA{EMA_FAST_PERIOD}={f'{ema_fast:.4f}' if ema_fast else 'warming'}\n"
                                 f"{chr(10).join(ema_labels)}\n"
-                                f"Regime: {best_regime} (score {score}/3)\n"
+                                f"Regime: {best_regime} (score {score}/{len(EMA_SLOW_PERIODS)})\n"
                                 f"Vol: {f'{vol:.4f}' if vol else 'N/A'}\n"
                                 f"Capital Fraction: {fraction:.0%}\nFiat: {fiat:.2f}\nTime: {now}"
                             ))
@@ -785,8 +977,6 @@ class TradingBot:
                         else:
                             self.mode = 'holding'
                             self.active_pair = best_pair
-                            self.pair_peaks[best_pair] = price
-                            self.pair_dip_lows[best_pair] = 0.0
                             self._dip_notified[best_pair] = False
                             self._min_vol_notified = False
                             self._buy_failed_notified = False
