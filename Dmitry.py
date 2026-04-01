@@ -47,13 +47,17 @@ RSI_MAX_ENTRY = 50           # skip entry if RSI >= 50 on 1-minute chart
 # 2.5x ATR is the research-backed sweet spot for intraday crypto.
 ATR_PERIOD = 14
 ATR_STOP_MULT = 2.5
-TRAILING_STOP_PCT = 0.05     # emergency floor: max 5% loss from entry price
-MIN_ATR_STOP_PCT = 0.010     # minimum stop buffer: 1% below entry_high
-                              # (prevents stop inside spread noise; gives ~1.5:1 R:R vs 1.5% TP)
+TRAILING_STOP_PCT = 0.05     # emergency floor: max 5% loss from entry (no nose-dive requirement)
+MIN_ATR_STOP_PCT = 0.040     # minimum stop distance: 4% below entry_high (crypto needs room to breathe)
 
 # Trailing stop cannot fire within this many seconds of entry.
 # Take-profit can still exit anytime.
 MIN_HOLD_SECONDS = 1800      # 30 minutes (up from 15 — gives trades time to develop)
+
+# Nose-dive confirmation: prevents stops on normal crypto volatility
+STOP_CONFIRM_TICKS = 3       # price must stay below stop level for this many consecutive seconds
+NOSEDIVE_LOOKBACK = 5        # candles (minutes) to look back when measuring rate of decline
+NOSEDIVE_PCT = 0.020         # price must have dropped 2% in NOSEDIVE_LOOKBACK candles to confirm a real crash
 
 # ---- Circuit breaker ----
 CONSECUTIVE_STOP_LIMIT = 2   # 2 consecutive trailing stops trigger cooldown
@@ -350,6 +354,9 @@ class TradingBot:
         self.consecutive_stops: int = 0
         self.cooldown_until: Optional[datetime] = None
 
+        # Nose-dive confirmation counter (consecutive seconds at or below stop level)
+        self.stop_below_ticks: int = 0
+
         # Notification flags
         self._dip_notified: dict[str, bool] = {pair: False for pair in PAIRS}
         self._min_vol_notified = False
@@ -469,6 +476,15 @@ class TradingBot:
             pc = candles[i - 1]['c']
             trs.append(max(h - l, abs(h - pc), abs(l - pc)))
         return sum(trs) / len(trs)
+
+    def _is_nosediving(self, pair: str, current_price: float) -> bool:
+        """True if price has dropped NOSEDIVE_PCT or more over the last NOSEDIVE_LOOKBACK candles.
+        Distinguishes a genuine crash from normal crypto intraday volatility."""
+        hist = self.candle_histories[pair]
+        if len(hist) < NOSEDIVE_LOOKBACK:
+            return False
+        past_close = list(hist)[-NOSEDIVE_LOOKBACK]['c']
+        return past_close > 0 and current_price <= past_close * (1 - NOSEDIVE_PCT)
 
     def _candle_vol(self, pair: str) -> Optional[float]:
         """Average absolute per-candle return over VOL_LOOKBACK candles."""
@@ -688,6 +704,7 @@ class TradingBot:
 
         self.entry_high = self.entry_price
         self.entry_time = datetime.now()
+        self.stop_below_ticks = 0
         self.logger.log("BUY", actual_price, volume, fiat_display, crypto_display,
                         note=f"pair={pair}, regime={regime}, frac={fraction:.0%}")
         self.notifier.send("Dmitry made a buy!", (
@@ -809,19 +826,28 @@ class TradingBot:
                     stop_floor = self.entry_price * (1 - TRAILING_STOP_PCT)
 
                     if atr is not None:
-                        # Use whichever ATR distance is larger: computed ATR or the 1% floor.
-                        # 1-minute ATR is meaningful (unlike old 14-second ATR) so 2.5x is real.
                         atr_distance = max(ATR_STOP_MULT * atr, self.entry_high * MIN_ATR_STOP_PCT)
                         atr_stop = self.entry_high - atr_distance
-                        trailing_stop = price <= max(atr_stop, stop_floor)
+                        at_stop_level = price <= max(atr_stop, stop_floor)
                     else:
-                        trailing_stop = price <= stop_floor
+                        at_stop_level = price <= stop_floor
 
-                    # Trailing stop cannot fire within MIN_HOLD_SECONDS of entry.
-                    # Take-profit can still exit anytime.
                     time_held = (now - self.entry_time).total_seconds() if self.entry_time else MIN_HOLD_SECONDS
-                    if trailing_stop and time_held < MIN_HOLD_SECONDS:
-                        trailing_stop = False
+
+                    # Track consecutive seconds at or below the stop level; reset if price recovers.
+                    if at_stop_level and time_held >= MIN_HOLD_SECONDS:
+                        self.stop_below_ticks += 1
+                    else:
+                        self.stop_below_ticks = 0
+
+                    # Hard floor (5% below entry): always exit — catastrophic drop protection.
+                    # ATR trailing stop: only exit on a confirmed nose dive, not normal volatility.
+                    trailing_stop = (price <= stop_floor) or (
+                        at_stop_level
+                        and time_held >= MIN_HOLD_SECONDS
+                        and self.stop_below_ticks >= STOP_CONFIRM_TICKS
+                        and self._is_nosediving(self.active_pair, price)
+                    )
 
                     if take_profit or trailing_stop:
                         reason = 'take-profit' if take_profit else 'trailing-stop'
