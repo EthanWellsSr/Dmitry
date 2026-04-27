@@ -1,6 +1,7 @@
 import krakenex
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import traceback
 import gspread
@@ -77,8 +78,14 @@ TARGET_VOL = 0.003           # reference vol for full position sizing
 # ---- Entry thresholds ----
 MIN_BUY_DIP = 0.004          # price must be >= 0.4% below rolling 20-candle peak
 VOL_DIP_MULT = 1.0
-MIN_SELL_RISE = 0.015        # 1.5% take-profit floor
+MIN_SELL_RISE = 0.015        # 1.5% take-profit ARMING threshold (does not exit immediately — see TAKE_PROFIT_TRAIL_PCT)
 VOL_SELL_MULT = 1.5
+
+# CHANGE 1 (2026-04-27): trailing take-profit. Once price exceeds the MIN_SELL_RISE
+# threshold, profit-lock arms; from then on we trail the peak and only sell when
+# price retraces by TAKE_PROFIT_TRAIL_PCT. Lets winners ride strong rallies instead
+# of clipping at +1.5% (which left ~$2.5 / +2.8% over 25 days vs. SOL's +11%).
+TAKE_PROFIT_TRAIL_PCT = 0.010  # sell when price drops 1% from peak after profit armed
 
 # Bounce confirmation: require this many consecutive rising candle closes before entry.
 # Replaces the old 0.5%-bounce hack — candle closes are far more reliable.
@@ -96,6 +103,12 @@ MIN_BUY_VOLUME = {
 BASE_RISK_FRACTION = 0.90
 MAX_RISK_FRACTION = 0.90
 MIN_RISK_FRACTION = 0.25
+
+# CHANGE 2 (2026-04-27): concurrent positions across uncorrelated pairs.
+# Up to MAX_CONCURRENT_POSITIONS slots, each consuming roughly an equal share of
+# free fiat (capped overall by BASE_RISK_FRACTION). Closes the gap with HODL when
+# multiple eligible pairs trend at the same time (e.g. SOL+ETH+XRP all bull).
+MAX_CONCURRENT_POSITIONS = 3
 
 # ---- Google Sheets ----
 GOOGLE_KEY_FILE = 'google_key.json'
@@ -326,6 +339,22 @@ def _next_top_of_hour(dt: Optional[datetime] = None) -> datetime:
     return dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
 
 
+# CHANGE 2 (2026-04-27): per-pair position state. Replaces the single-position
+# attrs (entry_price, entry_high, entry_time, stop_below_ticks, profit_locked)
+# that used to live on TradingBot. Each held pair gets its own Position.
+@dataclass
+class Position:
+    pair: str
+    entry_price: float
+    entry_high: float
+    entry_time: datetime
+    stop_below_ticks: int = 0
+    # CHANGE 1 (2026-04-27): trailing take-profit state.
+    # Arms when price first exceeds entry * (1 + sell_rise); after that the
+    # take-profit becomes a trail at TAKE_PROFIT_TRAIL_PCT below entry_high.
+    profit_locked: bool = False
+
+
 class TradingBot:
     BUY_BUFFER = 0.995  # use ~99.5% of fiat to avoid EOrder:Insufficient funds
 
@@ -335,10 +364,11 @@ class TradingBot:
         self.kraken = KrakenClient()
         self.simulation = SIMULATION or self.kraken.forced_simulation
 
-        self.mode = 'waiting'
-        self.active_pair: Optional[str] = None
-        self.entry_price: Optional[float] = None
-        self.entry_high: float = 0.0
+        # CHANGE 2 (2026-04-27): per-pair Position objects instead of single-slot state.
+        # The bot is in "waiting" iff this dict is empty, "holding" otherwise.
+        # Per-position state (entry_price, entry_high, entry_time, stop_below_ticks,
+        # profit_locked) now lives on each Position rather than on the bot.
+        self.positions: dict[str, Position] = {}
         self.trade_count = 0
 
         # 1-minute OHLC candle histories per pair (dicts with t/o/h/l/c/v keys)
@@ -347,15 +377,9 @@ class TradingBot:
         }
         self.last_candle_update: float = 0.0
 
-        # Entry timing (used to enforce MIN_HOLD_SECONDS before trailing stop can fire)
-        self.entry_time: Optional[datetime] = None
-
-        # Circuit breaker state
+        # Circuit breaker state (global across all positions)
         self.consecutive_stops: int = 0
         self.cooldown_until: Optional[datetime] = None
-
-        # Nose-dive confirmation counter (consecutive seconds at or below stop level)
-        self.stop_below_ticks: int = 0
 
         # Notification flags
         self._dip_notified: dict[str, bool] = {pair: False for pair in PAIRS}
@@ -365,9 +389,9 @@ class TradingBot:
         self._buy_warn_sent = False
         self._sell_warn_sent = False
 
-        # Simulation state
+        # Simulation state (CHANGE 2: per-pair sim crypto for concurrent positions)
         self._sim_fiat = 1000.0
-        self._sim_crypto = 0.0
+        self._sim_crypto: dict[str, float] = {pair: 0.0 for pair in PAIRS}
 
         # Warm up candle histories BEFORE recovery so ATR/EMAs are ready immediately.
         # This is especially important when restarting with an open position.
@@ -591,19 +615,25 @@ class TradingBot:
 
     def _get_balance(self, crypto_key: str = '') -> tuple[float, float]:
         if self.simulation:
-            return self._sim_fiat, self._sim_crypto
+            # CHANGE 2: per-pair sim crypto. Look up by Kraken crypto_key.
+            # If empty key, return total sim crypto across pairs (rare path).
+            if crypto_key:
+                pair = next((p for p, k in PAIRS.items() if k == crypto_key), None)
+                crypto_amt = self._sim_crypto.get(pair, 0.0) if pair else 0.0
+            else:
+                crypto_amt = sum(self._sim_crypto.values())
+            return self._sim_fiat, crypto_amt
         return self.kraken.get_balance(crypto_key)
 
     # ----- RECOVERY -----
 
     def _recover_state(self):
         """
-        On startup, check if we already hold a position from a previous run.
-        Because _warmup_candles() was called first, candle indicators are ready
-        and the ATR/stop calculations will be accurate from tick 1.
+        On startup, check whether we already hold any positions from a previous run.
+        With CHANGE 2, the bot can hold up to MAX_CONCURRENT_POSITIONS pairs at once,
+        so this scans every configured pair and rebuilds a Position for each holding.
         """
         if self.simulation:
-            self.mode = 'waiting'
             print(f"🔁 Recovered: waiting (simulation), fiat={self._sim_fiat:.2f}")
             return
 
@@ -614,62 +644,77 @@ class TradingBot:
             crypto = balances.get(crypto_key, 0.0)
             min_vol = MIN_BUY_VOLUME.get(pair, 0.0)
             if crypto > min_vol * 0.5:
-                self.mode = 'holding'
-                self.active_pair = pair
+                entry_price = None
                 for attempt in range(3):
-                    self.entry_price = self.kraken.get_last_buy_price(pair)
-                    if self.entry_price:
-                        self.entry_high = self.entry_price
-                        # Set entry_time far enough in the past so the trailing stop
-                        # can fire if the position has already moved against us.
-                        # The 30-min hold time is waived on recovery — we don't know
-                        # how long this position has been open.
-                        self.entry_time = datetime.now() - timedelta(seconds=MIN_HOLD_SECONDS)
-                        print(f"🔁 Recovered: holding {pair}, crypto={crypto:.6f}, entry={self.entry_price:.6f}")
-                        atr = self._true_atr(pair)
-                        print(f"   ATR(14) on 1m candles: {atr:.6f}" if atr else "   ATR not yet available")
-                        return
-                    print(f"⚠️ Buy price recovery attempt {attempt + 1}/3 failed")
+                    entry_price = self.kraken.get_last_buy_price(pair)
+                    if entry_price:
+                        break
+                    print(f"⚠️ Buy price recovery attempt {attempt + 1}/3 failed for {pair}")
                     if attempt < 2:
                         time.sleep(5)
-                msg = (
-                    f"CRITICAL: Could not recover entry price!\n"
-                    f"Pair: {pair}\nCrypto: {crypto:.6f}\n"
-                    f"Failed after 3 attempts.\nTime: {datetime.now()}\n\n"
-                    f"Please check manually and restart Dmitry."
-                )
-                self.notifier.send("Dmitry Recovery FAILED", msg)
-                raise RuntimeError(f"Failed to recover entry price for {pair} after 3 attempts")
 
-        self.mode = 'waiting'
-        print(f"🔁 Recovered: waiting, fiat={fiat:.2f}")
+                if not entry_price:
+                    msg = (
+                        f"CRITICAL: Could not recover entry price!\n"
+                        f"Pair: {pair}\nCrypto: {crypto:.6f}\n"
+                        f"Failed after 3 attempts.\nTime: {datetime.now()}\n\n"
+                        f"Please check manually and restart Dmitry."
+                    )
+                    self.notifier.send("Dmitry Recovery FAILED", msg)
+                    raise RuntimeError(f"Failed to recover entry price for {pair} after 3 attempts")
+
+                # The 30-min hold time is waived on recovery — we don't know
+                # how long this position has been open.
+                self.positions[pair] = Position(
+                    pair=pair,
+                    entry_price=entry_price,
+                    entry_high=entry_price,
+                    entry_time=datetime.now() - timedelta(seconds=MIN_HOLD_SECONDS),
+                )
+                print(f"🔁 Recovered: holding {pair}, crypto={crypto:.6f}, entry={entry_price:.6f}")
+                atr = self._true_atr(pair)
+                print(f"   ATR(14) on 1m candles: {atr:.6f}" if atr else "   ATR not yet available")
+
+        if self.positions:
+            print(f"🔁 Recovered {len(self.positions)} active position(s): "
+                  f"{', '.join(self.positions.keys())}")
+        else:
+            print(f"🔁 Recovered: waiting, fiat={fiat:.2f}")
 
     # ----- TRADING -----
 
     def _buy(self, pair: str, fiat_balance: float, price: float, fraction: float = 1.0, regime: str = ''):
         crypto_key = PAIRS[pair]
         min_vol = MIN_BUY_VOLUME.get(pair, 1.0)
-        capital = fiat_balance * max(0.0, min(1.0, fraction))
+        # CHANGE 2: per-slot sizing. Each open slot consumes 1/(remaining slots) of
+        # currently free fiat, scaled by the volatility-adjusted `fraction`. Three
+        # equal-sized slots end up with ~30% of starting bankroll each, capping
+        # aggregate exposure near BASE_RISK_FRACTION.
+        remaining_slots = max(1, MAX_CONCURRENT_POSITIONS - len(self.positions))
+        slot_share = 1.0 / remaining_slots
+        effective_fraction = max(0.0, min(1.0, fraction)) * slot_share
+        capital = fiat_balance * effective_fraction
 
         if self.simulation:
             volume = round((capital * self.BUY_BUFFER) / price, 6)
             if volume < min_vol:
                 print(f"⚠️ Buy skipped: volume {volume:.6f} {crypto_key} is below minimum {min_vol}")
                 return
-            self._sim_crypto = volume
+            self._sim_crypto[pair] = self._sim_crypto.get(pair, 0.0) + volume
             self._sim_fiat = fiat_balance - (volume * price)
-            self.entry_price = price
             actual_price = price
-            fiat_display, crypto_display = self._sim_fiat, self._sim_crypto
+            fiat_display, crypto_display = self._sim_fiat, self._sim_crypto[pair]
         else:
             fiat_before, _ = self.kraken.get_balance(crypto_key)
-            capital = fiat_before * max(0.0, min(1.0, fraction))
+            capital = fiat_before * effective_fraction
             volume = round((capital * self.BUY_BUFFER) / price, 6)
             if volume < min_vol:
                 if not self._min_vol_notified:
                     msg = (
                         f"Buy skipped: volume {volume:.6f} {crypto_key} is below minimum {min_vol}\n"
-                        f"Pair: {pair}\nFiat: {fiat_before:.2f}, Price: {price:.6f}, Fraction: {fraction:.0%}\n"
+                        f"Pair: {pair}\nFiat: {fiat_before:.2f}, Price: {price:.6f}, "
+                        f"Fraction: {fraction:.0%} (slot share {slot_share:.0%}, "
+                        f"effective {effective_fraction:.0%})\n"
                         f"Time: {datetime.now()}"
                     )
                     print(f"⚠️ {msg}")
@@ -699,36 +744,43 @@ class TradingBot:
             if fiat_after is None or crypto_after is None:
                 fiat_after, crypto_after = self.kraken.get_balance(crypto_key)
             actual_price = (fiat_before - fiat_after) / crypto_after if crypto_after else price
-            self.entry_price = actual_price
             fiat_display, crypto_display = fiat_after, crypto_after
 
-        self.entry_high = self.entry_price
-        self.entry_time = datetime.now()
-        self.stop_below_ticks = 0
+        # CHANGE 2: register a Position rather than mutating bot-level state.
+        self.positions[pair] = Position(
+            pair=pair,
+            entry_price=actual_price,
+            entry_high=actual_price,
+            entry_time=datetime.now(),
+        )
         self.logger.log("BUY", actual_price, volume, fiat_display, crypto_display,
-                        note=f"pair={pair}, regime={regime}, frac={fraction:.0%}")
+                        note=f"pair={pair}, regime={regime}, frac={effective_fraction:.0%}, "
+                             f"slot={len(self.positions)}/{MAX_CONCURRENT_POSITIONS}")
         self.notifier.send("Dmitry made a buy!", (
             f"Pair: {pair}\nRegime: {regime}\nEntry Price: {actual_price:.6f}\nVolume: {volume:.6f}\n"
-            f"Capital Deployed: {fraction:.0%}\n"
+            f"Slot: {len(self.positions)}/{MAX_CONCURRENT_POSITIONS} "
+            f"(effective fraction {effective_fraction:.0%})\n"
             f"Balances -> Fiat: {fiat_display:.2f}, Crypto: {crypto_display:.8f}\n"
             f"Time: {datetime.now()}"
         ))
 
     def _sell(self, pair: str, crypto_balance: float, price: float, reason: str = 'take-profit'):
         crypto_key = PAIRS[pair]
+        # CHANGE 2: pull the entry price from the per-pair Position so multiple
+        # concurrent positions can each report their own P/L on exit.
+        position = self.positions.get(pair)
+        entry_price = position.entry_price if position else None
 
         if self.simulation:
-            self._sim_fiat = crypto_balance * price
-            self._sim_crypto = 0.0
-            fiat_display, crypto_display = self._sim_fiat, self._sim_crypto
+            self._sim_fiat = self._sim_fiat + crypto_balance * price
+            self._sim_crypto[pair] = 0.0
+            fiat_display, crypto_display = self._sim_fiat, 0.0
         else:
             if not crypto_balance or crypto_balance <= 0:
-                if self.mode == 'holding':
-                    self.mode = 'waiting'
-                    self.active_pair = None
-                    self.entry_price = None
-                    self.entry_high = 0.0
-                    print("⚠️ State reset: No crypto to sell")
+                # No coin to sell — drop the position record if we still have one.
+                if pair in self.positions:
+                    del self.positions[pair]
+                    print(f"⚠️ State reset: No crypto to sell for {pair}")
                 return
             response = self.kraken.place_order('sell', crypto_balance, pair)
             if not response or response.get('error'):
@@ -747,18 +799,17 @@ class TradingBot:
             fiat_display = fiat_after or 0.0
             crypto_display = crypto_after or 0.0
 
-        pnl_pct = ((price - self.entry_price) / self.entry_price * 100) if self.entry_price else 0.0
-        self.mode = 'waiting'
-        self.active_pair = None
-        self.entry_price = None
-        self.entry_high = 0.0
-        self.entry_time = None
+        pnl_pct = ((price - entry_price) / entry_price * 100) if entry_price else 0.0
+        # CHANGE 2: drop the position from the dict; remaining positions stay open.
+        if pair in self.positions:
+            del self.positions[pair]
         self.trade_count += 1
         self.logger.log("SELL", price, crypto_balance, fiat_display, crypto_display,
                         note=f"{reason}, pair={pair}")
         self.notifier.send(f"Dmitry sold ({reason})", (
             f"Trade #: {self.trade_count}\nPair: {pair}\nReason: {reason}\n"
             f"Sell Price: {price:.6f}\nP/L: {pnl_pct:+.2f}%\n"
+            f"Open positions remaining: {len(self.positions)}/{MAX_CONCURRENT_POSITIONS}\n"
             f"Balances -> Fiat: {fiat_display:.2f}, Crypto: {crypto_display:.8f}\n"
             f"Time: {datetime.now()}"
         ))
@@ -769,13 +820,15 @@ class TradingBot:
         if SEND_STARTUP_EMAIL:
             self.notifier.send("Dmitry Started", (
                 "Dmitry just started successfully.\n\n"
-                "Key changes in this version:\n"
-                "- All indicators now use 1-minute OHLC candles (not 1-second ticks)\n"
-                "- RSI(14) filter added: only enter when RSI < 50\n"
-                "- Bull regime required: EMA20 > EMA50 > EMA100 > EMA200 (all on 1-minute)\n"
-                "- Bounce confirmation: 2 consecutive higher candle closes required\n"
-                "- Min hold time: 30 minutes\n"
-                "- Stop floor: 1% below entry high (up from 1.5%)\n"
+                "Key changes in this version (2026-04-27):\n"
+                f"- CHANGE 1: trailing take-profit. Once price hits +{MIN_SELL_RISE:.1%} "
+                f"the take-profit arms; we then trail entry_high and only exit when price "
+                f"falls {TAKE_PROFIT_TRAIL_PCT:.1%} below the peak.\n"
+                f"- CHANGE 2: up to {MAX_CONCURRENT_POSITIONS} concurrent positions across "
+                f"uncorrelated pairs; each new slot consumes ~1/N of free fiat.\n"
+                "- All indicators continue to use 1-minute OHLC candles\n"
+                "- Bull-regime only entries (EMA20 > EMA50 > EMA100 > EMA200) + RSI < 50\n"
+                f"- Stop floor: {TRAILING_STOP_PCT:.0%} below entry, ATR stop with nose-dive confirmation\n"
             ))
 
         next_heartbeat = _next_top_of_hour()
@@ -798,63 +851,69 @@ class TradingBot:
                     time.sleep(2)
                     continue
 
-                # ----- HOLDING MODE -----
+                # ----- EXITS: iterate every open position -----
+                # CHANGE 2: holding/waiting are no longer mutually exclusive. We
+                # check exits on every active position, then look for entries on
+                # any free slot. Use list() since _sell mutates self.positions.
 
-                if self.mode == 'holding' and self.active_pair:
-                    crypto_key = PAIRS[self.active_pair]
+                for pair, position in list(self.positions.items()):
+                    crypto_key = PAIRS[pair]
                     _, crypto = self._get_balance(crypto_key)
-                    min_vol = MIN_BUY_VOLUME.get(self.active_pair, 0.0)
+                    min_vol = MIN_BUY_VOLUME.get(pair, 0.0)
                     if crypto < min_vol * 0.5:
-                        print(f"⚠️ Safety reset: holding mode but {crypto_key}={crypto:.8f}")
-                        self.mode = 'waiting'
-                        self.active_pair = None
-                        self.entry_price = None
-                        self.entry_high = 0.0
-
-                if self.mode == 'holding' and self.active_pair and self.entry_price:
-                    price = prices.get(self.active_pair)
-                    if price is None:
-                        time.sleep(1)
+                        print(f"⚠️ Safety reset: held {pair} but {crypto_key}={crypto:.8f}")
+                        del self.positions[pair]
                         continue
 
-                    self.entry_high = max(self.entry_high, price)
-                    vol = self._candle_vol(self.active_pair)
+                    price = prices.get(pair)
+                    if price is None:
+                        continue
+
+                    position.entry_high = max(position.entry_high, price)
+                    vol = self._candle_vol(pair)
                     _, sell_rise = self._dynamic_thresholds(vol)
-                    atr = self._true_atr(self.active_pair)
+                    atr = self._true_atr(pair)
 
-                    take_profit = price >= self.entry_price * (1 + sell_rise)
-                    stop_floor = self.entry_price * (1 - TRAILING_STOP_PCT)
+                    # --- CHANGE 1 (2026-04-27): trailing take-profit ---
+                    # Arm once price first crosses entry * (1 + sell_rise). After
+                    # arming, exit only when price retraces TAKE_PROFIT_TRAIL_PCT
+                    # from the running peak (entry_high). Lets winners ride.
+                    target_price = position.entry_price * (1 + sell_rise)
+                    if not position.profit_locked and price >= target_price:
+                        position.profit_locked = True
+                    take_profit = (
+                        position.profit_locked
+                        and price <= position.entry_high * (1 - TAKE_PROFIT_TRAIL_PCT)
+                    )
 
+                    stop_floor = position.entry_price * (1 - TRAILING_STOP_PCT)
                     if atr is not None:
-                        atr_distance = max(ATR_STOP_MULT * atr, self.entry_high * MIN_ATR_STOP_PCT)
-                        atr_stop = self.entry_high - atr_distance
+                        atr_distance = max(ATR_STOP_MULT * atr, position.entry_high * MIN_ATR_STOP_PCT)
+                        atr_stop = position.entry_high - atr_distance
                         at_stop_level = price <= max(atr_stop, stop_floor)
                     else:
                         at_stop_level = price <= stop_floor
 
-                    time_held = (now - self.entry_time).total_seconds() if self.entry_time else MIN_HOLD_SECONDS
+                    time_held = (now - position.entry_time).total_seconds()
 
-                    # Track consecutive seconds at or below the stop level; reset if price recovers.
                     if at_stop_level and time_held >= MIN_HOLD_SECONDS:
-                        self.stop_below_ticks += 1
+                        position.stop_below_ticks += 1
                     else:
-                        self.stop_below_ticks = 0
+                        position.stop_below_ticks = 0
 
                     # Hard floor (5% below entry): always exit — catastrophic drop protection.
                     # ATR trailing stop: only exit on a confirmed nose dive, not normal volatility.
                     trailing_stop = (price <= stop_floor) or (
                         at_stop_level
                         and time_held >= MIN_HOLD_SECONDS
-                        and self.stop_below_ticks >= STOP_CONFIRM_TICKS
-                        and self._is_nosediving(self.active_pair, price)
+                        and position.stop_below_ticks >= STOP_CONFIRM_TICKS
+                        and self._is_nosediving(pair, price)
                     )
 
                     if take_profit or trailing_stop:
                         reason = 'take-profit' if take_profit else 'trailing-stop'
-                        pair_selling = self.active_pair
-                        crypto_key = PAIRS[pair_selling]
                         _, pre_crypto = self._get_balance(crypto_key)
-                        self._sell(pair_selling, pre_crypto, price, reason=reason)
+                        self._sell(pair, pre_crypto, price, reason=reason)
                         _, post_crypto = self._get_balance(crypto_key)
 
                         if abs(pre_crypto - post_crypto) < 1e-6:
@@ -871,7 +930,7 @@ class TradingBot:
                                     msg = (
                                         f"{self.consecutive_stops} consecutive trailing stops hit.\n"
                                         f"Cooling down until {self.cooldown_until.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                                        f"Last pair: {pair_selling}\nTime: {now}"
+                                        f"Last pair: {pair}\nTime: {now}"
                                     )
                                     print(f"🛑 Circuit breaker triggered. {msg}")
                                     self.notifier.send("Dmitry Circuit Breaker", msg)
@@ -879,134 +938,132 @@ class TradingBot:
                                 self.consecutive_stops = 0
                             self._sell_warn_sent = False
 
-                # ----- WAITING MODE -----
+                # ----- ENTRIES: fill open slots -----
+                # CHANGE 2: previously gated behind `mode == 'waiting'`. Now we
+                # always evaluate entries when at least one slot is free and the
+                # candidate pair is not already held.
 
-                elif self.mode == 'waiting':
-                    if self.cooldown_until:
-                        if now >= self.cooldown_until:
-                            print(f"▶ Cooldown expired. Resuming trading.")
-                            self.cooldown_until = None
-                            self.consecutive_stops = 0
-                        else:
-                            time.sleep(1)
-                            continue
+                if len(self.positions) >= MAX_CONCURRENT_POSITIONS:
+                    time.sleep(1)
+                    continue
 
-                    # Time-of-day filter: skip entries during low-liquidity hours (UTC).
-                    # Spreads widen and thin order books produce noise-based false signals.
-                    utc_hour = datetime.utcnow().hour
-                    in_low_liquidity = (
-                        utc_hour >= LOW_LIQUIDITY_START_UTC or utc_hour < LOW_LIQUIDITY_END_UTC
-                    )
-                    if in_low_liquidity:
+                if self.cooldown_until:
+                    if now >= self.cooldown_until:
+                        print(f"▶ Cooldown expired. Resuming trading.")
+                        self.cooldown_until = None
+                        self.consecutive_stops = 0
+                    else:
                         time.sleep(1)
                         continue
 
-                    fiat, _ = self._get_balance()
+                # Time-of-day filter: skip new entries during low-liquidity hours (UTC).
+                # Exits above continue to run regardless.
+                utc_hour = datetime.utcnow().hour
+                in_low_liquidity = (
+                    utc_hour >= LOW_LIQUIDITY_START_UTC or utc_hour < LOW_LIQUIDITY_END_UTC
+                )
+                if in_low_liquidity:
+                    time.sleep(1)
+                    continue
 
-                    best_pair = None
-                    best_effective_score = -2
-                    best_regime = ''
+                fiat, _ = self._get_balance()
 
-                    for pair in PAIRS:
-                        if pair not in prices:
-                            continue
-                        price = prices[pair]
+                best_pair = None
+                best_effective_score = -2
+                best_regime = ''
 
-                        # --- Candle-based indicators ---
-                        ema_fast = self._ema_from_candles(EMA_FAST_PERIOD, pair)
-                        slow_emas = [self._ema_from_candles(p, pair) for p in EMA_SLOW_PERIODS]
-                        vol = self._candle_vol(pair)
-                        regime, score = self._market_regime(ema_fast, slow_emas, pair)
+                for pair in PAIRS:
+                    if pair in self.positions:  # already held — skip
+                        continue
+                    if pair not in prices:
+                        continue
+                    price = prices[pair]
 
-                        # Only enter in confirmed bull regime (all EMAs aligned on 1-minute candles).
-                        # This is the single most important filter — it prevents buying in downtrends.
-                        if regime != 'bull':
-                            self._dip_notified[pair] = False
-                            continue
+                    # --- Candle-based indicators ---
+                    ema_fast = self._ema_from_candles(EMA_FAST_PERIOD, pair)
+                    slow_emas = [self._ema_from_candles(p, pair) for p in EMA_SLOW_PERIODS]
+                    vol = self._candle_vol(pair)
+                    regime, score = self._market_regime(ema_fast, slow_emas, pair)
 
-                        # Skip if volatility is too high (chaotic market)
-                        if vol is not None and vol > MAX_ENTRY_VOL:
-                            self._dip_notified[pair] = False
-                            continue
+                    if regime != 'bull':
+                        self._dip_notified[pair] = False
+                        continue
 
-                        # --- RSI filter ---
-                        # Don't enter if RSI >= RSI_MAX_ENTRY. This ensures we only buy
-                        # when price has genuinely pulled back, not when it's still elevated.
-                        rsi = self._rsi(pair)
-                        if rsi is not None and rsi >= RSI_MAX_ENTRY:
-                            self._dip_notified[pair] = False
-                            continue
+                    if vol is not None and vol > MAX_ENTRY_VOL:
+                        self._dip_notified[pair] = False
+                        continue
 
-                        # --- Dip detection (rolling 20-candle peak) ---
-                        rolling_peak = self._rolling_peak(pair, lookback=20)
-                        if rolling_peak is None:
-                            continue
+                    rsi = self._rsi(pair)
+                    if rsi is not None and rsi >= RSI_MAX_ENTRY:
+                        self._dip_notified[pair] = False
+                        continue
+
+                    rolling_peak = self._rolling_peak(pair, lookback=20)
+                    if rolling_peak is None:
+                        continue
+                    buy_dip, _ = self._dynamic_thresholds(vol)
+                    dip_pct = (rolling_peak - price) / rolling_peak
+
+                    if dip_pct < buy_dip:
+                        self._dip_notified[pair] = False
+                        continue
+
+                    if not self._has_bounce_confirmation(pair):
+                        continue
+
+                    effective_score = score if regime != 'unknown' else -1
+                    if effective_score > best_effective_score:
+                        best_effective_score = effective_score
+                        best_pair = pair
+                        best_regime = regime
+
+                if best_pair and fiat > 1:
+                    price = prices[best_pair]
+                    vol = self._candle_vol(best_pair)
+                    fraction = self._position_fraction(vol)
+
+                    if not self._dip_notified[best_pair]:
+                        self._dip_notified[best_pair] = True
+                        ema_fast = self._ema_from_candles(EMA_FAST_PERIOD, best_pair)
+                        slow_emas = [self._ema_from_candles(p, best_pair) for p in EMA_SLOW_PERIODS]
+                        _, score = self._market_regime(ema_fast, slow_emas, best_pair)
+                        ema_labels = [
+                            f"EMA{p}={f'{s:.4f}' if s else 'warming'}"
+                            for p, s in zip(EMA_SLOW_PERIODS, slow_emas)
+                        ]
                         buy_dip, _ = self._dynamic_thresholds(vol)
+                        rolling_peak = self._rolling_peak(best_pair, lookback=20) or price
                         dip_pct = (rolling_peak - price) / rolling_peak
+                        rsi = self._rsi(best_pair)
+                        self.notifier.send("Dmitry Dip Triggered", (
+                            f"Pair: {best_pair}\nPrice: {price:.6f}\n"
+                            f"Rolling Peak (20c): {rolling_peak:.6f}\n"
+                            f"Dip: {dip_pct:.4%} (threshold: {buy_dip:.4%})\n"
+                            f"RSI(14): {f'{rsi:.1f}' if rsi is not None else 'N/A'}\n"
+                            f"EMA{EMA_FAST_PERIOD}={f'{ema_fast:.4f}' if ema_fast else 'warming'}\n"
+                            f"{chr(10).join(ema_labels)}\n"
+                            f"Regime: {best_regime} (score {score}/{len(EMA_SLOW_PERIODS)})\n"
+                            f"Vol: {f'{vol:.4f}' if vol else 'N/A'}\n"
+                            f"Slot: {len(self.positions) + 1}/{MAX_CONCURRENT_POSITIONS}\n"
+                            f"Capital Fraction: {fraction:.0%}\nFiat: {fiat:.2f}\nTime: {now}"
+                        ))
 
-                        if dip_pct < buy_dip:
-                            self._dip_notified[pair] = False
-                            continue
+                    pre_fiat, _ = self._get_balance()
+                    pre_count = len(self.positions)
+                    self._buy(best_pair, pre_fiat, price, fraction=fraction, regime=best_regime)
 
-                        # --- Bounce confirmation ---
-                        # Require BOUNCE_CANDLES_REQUIRED consecutive higher candle closes.
-                        # This confirms the dip has reversed and avoids catching a falling knife.
-                        if not self._has_bounce_confirmation(pair):
-                            continue
-
-                        effective_score = score if regime != 'unknown' else -1
-                        if effective_score > best_effective_score:
-                            best_effective_score = effective_score
-                            best_pair = pair
-                            best_regime = regime
-
-                    if best_pair and fiat > 1:
-                        price = prices[best_pair]
-                        vol = self._candle_vol(best_pair)
-                        fraction = self._position_fraction(vol)
-
-                        if not self._dip_notified[best_pair]:
-                            self._dip_notified[best_pair] = True
-                            ema_fast = self._ema_from_candles(EMA_FAST_PERIOD, best_pair)
-                            slow_emas = [self._ema_from_candles(p, best_pair) for p in EMA_SLOW_PERIODS]
-                            _, score = self._market_regime(ema_fast, slow_emas, best_pair)
-                            ema_labels = [
-                                f"EMA{p}={f'{s:.4f}' if s else 'warming'}"
-                                for p, s in zip(EMA_SLOW_PERIODS, slow_emas)
-                            ]
-                            buy_dip, _ = self._dynamic_thresholds(vol)
-                            rolling_peak = self._rolling_peak(best_pair, lookback=20) or price
-                            dip_pct = (rolling_peak - price) / rolling_peak
-                            rsi = self._rsi(best_pair)
-                            self.notifier.send("Dmitry Dip Triggered", (
-                                f"Pair: {best_pair}\nPrice: {price:.6f}\n"
-                                f"Rolling Peak (20c): {rolling_peak:.6f}\n"
-                                f"Dip: {dip_pct:.4%} (threshold: {buy_dip:.4%})\n"
-                                f"RSI(14): {f'{rsi:.1f}' if rsi is not None else 'N/A'}\n"
-                                f"EMA{EMA_FAST_PERIOD}={f'{ema_fast:.4f}' if ema_fast else 'warming'}\n"
-                                f"{chr(10).join(ema_labels)}\n"
-                                f"Regime: {best_regime} (score {score}/{len(EMA_SLOW_PERIODS)})\n"
-                                f"Vol: {f'{vol:.4f}' if vol else 'N/A'}\n"
-                                f"Capital Fraction: {fraction:.0%}\nFiat: {fiat:.2f}\nTime: {now}"
-                            ))
-
-                        pre_fiat, _ = self._get_balance()
-                        self._buy(best_pair, pre_fiat, price, fraction=fraction, regime=best_regime)
-                        post_fiat, _ = self._get_balance()
-
-                        if abs(pre_fiat - post_fiat) < 1e-6:
-                            if not self._buy_warn_sent:
-                                self.notifier.send("Dmitry Warning", "Buy may have failed — still in waiting mode.")
-                                self._buy_warn_sent = True
-                            else:
-                                print("⚠️ Buy may have failed (warning email already sent)")
+                    if len(self.positions) == pre_count:
+                        if not self._buy_warn_sent:
+                            self.notifier.send("Dmitry Warning",
+                                               "Buy may have failed — still searching.")
+                            self._buy_warn_sent = True
                         else:
-                            self.mode = 'holding'
-                            self.active_pair = best_pair
-                            self._dip_notified[best_pair] = False
-                            self._min_vol_notified = False
-                            self._buy_failed_notified = False
-                            self._buy_warn_sent = False
+                            print("⚠️ Buy may have failed (warning email already sent)")
+                    else:
+                        self._dip_notified[best_pair] = False
+                        self._min_vol_notified = False
+                        self._buy_failed_notified = False
+                        self._buy_warn_sent = False
 
                 time.sleep(1)
 

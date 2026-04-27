@@ -7,3 +7,6 @@ venv/
 
 # OS
 .DS_Store
+
+# Local-only working notes (never push)
+dmitry.md
