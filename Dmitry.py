@@ -15,6 +15,11 @@ import os
 # ----- CONFIG -----
 # ========================
 
+# Version stamp written into the "Push Date" column of every new sheet row.
+# Bump this on every git push so the trade log self-labels with the active
+# code version (and trades line up with development history at a glance).
+BOT_VERSION = "2026-04-27 (Trailing take-profit + concurrent positions)"
+
 SIMULATION = False
 
 # All tradeable pairs: {kraken_pair: balance_key}
@@ -195,7 +200,9 @@ class SheetsLogger:
             self._sheet = doc.worksheet("Trades")
         except gspread.WorksheetNotFound:
             self._sheet = doc.add_worksheet("Trades", rows="1000", cols="10")
-            self._sheet.append_row(["Time", "Type", "Price", "Volume", "Fiat", "Crypto", "Note"])
+            self._sheet.append_row(
+                ["Time", "Type", "Price", "Volume", "Fiat", "Crypto", "Note", "Push Date"]
+            )
         return self._sheet
 
     def log(self, trade_type: str, price: float, volume: float, fiat: float, crypto: float, note: str = ''):
@@ -207,6 +214,7 @@ class SheetsLogger:
             round(fiat, 6),
             round(crypto, 8),
             note,
+            BOT_VERSION,  # column H — auto-labels the trade with the active code version
         ]
         try:
             self._get_sheet().append_row(row, value_input_option="RAW")
