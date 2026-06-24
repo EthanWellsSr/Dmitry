@@ -8,5 +8,11 @@ venv/
 # OS
 .DS_Store
 
+# Credentials / secrets — never commit
+*.key
+google_key.json
+*_key.json
+.env
+
 # Local-only working notes (never push)
 dmitry.md
