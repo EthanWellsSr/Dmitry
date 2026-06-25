@@ -1,6 +1,6 @@
 # Dmitry
 
-Dmitry is a Python-based automated trading system built to explore real-time decision logic, API integration, and system reliability.  
+Dmitry is a Python-based automated trading system built to explore real-time decision logic, API integration, and system reliability, all while pushing the limits of Ai assisted development.  
 The project focuses on software architecture, automation, logging, and fault tolerance rather than trading performance.
 
 > **Note:** This project is for educational and experimental purposes only.
