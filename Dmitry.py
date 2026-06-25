@@ -4,8 +4,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import traceback
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+import csv
 import smtplib
 from email.mime.text import MIMEText
 from typing import Optional
@@ -15,7 +14,7 @@ import os
 # ----- CONFIG -----
 # ========================
 
-# Version stamp written into the "Push Date" column of every new sheet row.
+# Version stamp printed alongside every trade log line.
 # Bump this on every git push so the trade log self-labels with the active
 # code version (and trades line up with development history at a glance).
 BOT_VERSION = "2026-04-27 (Trailing take-profit + concurrent positions)"
@@ -115,9 +114,8 @@ MIN_RISK_FRACTION = 0.25
 # multiple eligible pairs trend at the same time (e.g. SOL+ETH+XRP all bull).
 MAX_CONCURRENT_POSITIONS = 3
 
-# ---- Google Sheets ----
-GOOGLE_KEY_FILE = 'google_key.json'
-GOOGLE_SHEET_NAME = 'Dmitry_trades'
+# ---- Trade log ----
+TRADE_LOG_FILE = 'trades.csv'
 
 # ---- Email alerts ----
 EMAIL_ALERTS = True
@@ -177,33 +175,15 @@ class Notifier:
 
 
 # ========================
-# ----- SHEETS LOGGER -----
+# ----- TRADE LOG -----
 # ========================
 
-class SheetsLogger:
-    def __init__(self, notifier: Notifier):
-        self.notifier = notifier
-        self._sheet = None
+class TradeLog:
+    HEADER = ["Time", "Type", "Price", "Volume", "Fiat", "Crypto", "Note", "Push Date"]
 
-    def _get_sheet(self):
-        if self._sheet:
-            return self._sheet
-        scope = [
-            "https://spreadsheets.google.com/feeds",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds = ServiceAccountCredentials.from_json_keyfile_name(
-            os.path.abspath(GOOGLE_KEY_FILE), scope
-        )
-        doc = gspread.authorize(creds).open(GOOGLE_SHEET_NAME)
-        try:
-            self._sheet = doc.worksheet("Trades")
-        except gspread.WorksheetNotFound:
-            self._sheet = doc.add_worksheet("Trades", rows="1000", cols="10")
-            self._sheet.append_row(
-                ["Time", "Type", "Price", "Volume", "Fiat", "Crypto", "Note", "Push Date"]
-            )
-        return self._sheet
+    def __init__(self, notifier: Notifier, file_path: str = TRADE_LOG_FILE):
+        self.notifier = notifier
+        self.file_path = file_path
 
     def log(self, trade_type: str, price: float, volume: float, fiat: float, crypto: float, note: str = ''):
         row = [
@@ -217,9 +197,14 @@ class SheetsLogger:
             BOT_VERSION,  # column H — auto-labels the trade with the active code version
         ]
         try:
-            self._get_sheet().append_row(row, value_input_option="RAW")
+            write_header = not os.path.exists(self.file_path)
+            with open(self.file_path, 'a', newline='') as f:
+                writer = csv.writer(f)
+                if write_header:
+                    writer.writerow(self.HEADER)
+                writer.writerow(row)
         except Exception as e:
-            print(f"⚠️ Google Sheets log failed: {e}")
+            print(f"⚠️ Trade log write failed: {e}")
             self.notifier.send("Trade Log Error", str(e))
 
 
@@ -368,7 +353,7 @@ class TradingBot:
 
     def __init__(self):
         self.notifier = Notifier()
-        self.logger = SheetsLogger(self.notifier)
+        self.logger = TradeLog(self.notifier)
         self.kraken = KrakenClient()
         self.simulation = SIMULATION or self.kraken.forced_simulation
 

@@ -13,7 +13,7 @@ Dmitry is designed as a continuously running service that:
 - Interfaces with the **Kraken** exchange API for market data and order execution
 - Operates in both **simulation** and **live** modes
 - Executes decisions based on configurable, indicator-driven thresholds
-- Logs all activity to Google Sheets for later analysis and verification
+- Logs all trades to a local CSV file for later analysis and verification
 - Sends automated email alerts and hourly health heartbeats
 
 The primary goal of the project is to practice building **maintainable, testable, and resilient software systems**.
@@ -27,7 +27,7 @@ The primary goal of the project is to practice building **maintainable, testable
 - **Live mode** using real Kraken account balances
 - **Candle-based indicators** — EMA, RSI, ATR, and volatility computed on 1-minute OHLC candles
 - **Multi-pair trading** across XRP, ETH, BTC, and SOL with up to 3 concurrent positions
-- **Automated logging** to Google Sheets for traceability (auto-stamped with the active code version)
+- **Automated logging** to a local CSV file for traceability (auto-stamped with the active code version)
 - **Email alerts** for trade execution, errors, and system heartbeat
 - **Graceful error handling**, crash notification, and open-position recovery on restart
 - **Config-driven behavior** (no hardcoded parameters in the trading logic)
@@ -38,13 +38,13 @@ The primary goal of the project is to practice building **maintainable, testable
 
 - **Python 3** (uses `dataclasses`, `typing`, `collections` from the standard library)
 - [`krakenex`](https://github.com/veox/python3-krakenex) — Kraken REST API client
-- [`gspread`](https://github.com/burnash/gspread) + `oauth2client` — Google Sheets trade logging
+- `csv` — local trade logging (standard library)
 - `smtplib` / `email` — SMTP email alerts (standard library)
 
 Install the third-party dependencies with:
 
 ```bash
-pip install krakenex gspread oauth2client
+pip install krakenex
 ```
 
 ---
@@ -78,7 +78,7 @@ Dmitry implements a trend-following, dip-buying strategy. All indicators are com
 - Core logic written in Python, organized into focused components:
   - `KrakenClient` — market data, balances, and order execution (with retry/back-off)
   - `TradingBot` — indicators, regime detection, entry/exit logic, and the main loop
-  - `SheetsLogger` — appends every trade to Google Sheets
+  - `TradeLog` — appends every trade to a local CSV file
   - `Notifier` — SMTP email alerts and heartbeats
   - `Position` — per-pair position state (entry, high-water mark, profit-lock)
 - Separation of concerns between decision logic, execution, and logging/notifications
@@ -90,19 +90,18 @@ Dmitry implements a trend-following, dip-buying strategy. All indicators are com
 
 ### 1. Credentials
 
-Dmitry expects three credential files in the project directory. **All are gitignored and must never be committed.**
+Dmitry expects two credential files in the project directory. **Both are gitignored and must never be committed.**
 
 | File              | Purpose                          | Format                                                                 |
 | ----------------- | -------------------------------- | ---------------------------------------------------------------------- |
 | `kraken.key`      | Kraken API access (live mode)    | krakenex format: API key on line 1, private key on line 2              |
 | `email.key`       | SMTP email alerts                | `EMAIL_SENDER=...`, `EMAIL_PASSWORD=...`, `EMAIL_RECEIVER=...` (one per line) |
-| `google_key.json` | Google Sheets service account    | Google service-account JSON key                                        |
 
 If `kraken.key` is missing, Dmitry automatically forces **simulation mode**. If `email.key` is missing or incomplete, email alerts are disabled gracefully.
 
-### 2. Google Sheet
+### 2. Trade Log
 
-Create a Google Sheet named `Dmitry_trades` and share it with the service account's email. Dmitry creates a `Trades` worksheet on first run with columns:
+Dmitry writes every trade to a local `trades.csv` file (gitignored), creating it automatically on the first trade with columns:
 
 `Time | Type | Price | Volume | Fiat | Crypto | Note | Push Date`
 
