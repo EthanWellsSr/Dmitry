@@ -142,6 +142,14 @@ It is **not** intended as a financial product or recommendation.
 
 ---
 
+## Contributing
+
+To propose a change, **fork** this repository, commit your changes to a branch
+on your fork, and open a **pull request** back to this repo. Please don't push
+directly to `main` — all changes should come in through a PR for review.
+
+---
+
 ## Status
 
 Active personal project.  
