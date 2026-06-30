@@ -15,5 +15,8 @@ venv/
 # Local-only working notes (never push)
 dmitry.md
 
-# Local trade log
+# Watchtower runtime state (regenerated on startup)
+watchtower_state.json
+
+# Legacy trade log (from the old trading bot)
 trades.csv
